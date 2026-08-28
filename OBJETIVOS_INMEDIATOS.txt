@@ -1,0 +1,53 @@
+OBJETIVOS_INMEDIATOS
+
+1. **Separar las pistas de comparación de las pistas que se conservan**
+   - Audio original HQ/LQ para detectar diferencias.
+   - Audios extranjeros LQ para corregir.
+   - Subtítulos LQ para corregir.
+   - Es la base de todo lo demás.
+
+2. **Fijar la normalización global por FPS**
+   - Usar `avg_frame_rate`.
+   - Normalizar el LQ de 25 FPS al timeline HQ de 23.976 FPS.
+   - Esta debe ser la única corrección global de velocidad.
+
+3. **Detectar y localizar las diferencias editoriales**
+   - Comparar los audios originales ya normalizados.
+   - Analizar waveform, envolvente y silencios.
+   - Encontrar el instante exacto donde aparece cada diferencia.
+
+4. **Crear una receta explícita de edición temporal**
+   Para cada diferencia indicar:
+   - intervalo que se elimina;
+   - intervalo que se conserva;
+   - hueco que se inserta;
+   - desplazamiento acumulado posterior;
+   - fuente utilizada para rellenar.
+
+5. **Aplicar la receta al audio extranjero**
+   - Cortar y desplazar.
+   - Eliminar silencios sobrantes.
+   - Insertar huecos cuando falte tiempo.
+   - Rellenar desde el audio original HQ cuando corresponda.
+   - Eliminar por completo la corrección mediante `atempo` por segmentos.
+
+6. **Aplicar exactamente la misma receta a los subtítulos**
+   - Los eventos dentro de intervalos eliminados se descartan o se recolocan según el caso.
+   - Los eventos posteriores se desplazan.
+   - No se aplica una escala temporal continua.
+
+7. **Extender el sistema a todas las pistas extranjeras**
+   - Una vez validada la primera pista, reutilizar la misma receta para las demás.
+   - Mantener su sincronización interna y sus metadatos.
+
+8. **Validar con este caso real y con pruebas controladas**
+   - Comparar duración final.
+   - Revisar varios puntos antes y después de cada corte.
+   - Comprobar audio, subtítulos y mux final.
+   - Añadir tests sintéticos para desfases, silencios largos, silencios cortos y cambios de FPS.
+
+La prioridad absoluta sería, por tanto:
+
+> **modelo correcto de pistas → FPS global → detección exacta → receta de cortes/desplazamientos → audio → subtítulos → múltiples pistas → validación.**
+
+No empezaría eliminando `atempo` sin haber creado antes la receta temporal, porque entonces tendríamos cortes aislados pero ningún mecanismo fiable para decidir qué quitar, qué insertar y cuánto desplazar.

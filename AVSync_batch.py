@@ -91,6 +91,12 @@ python AVSync_batch_regex.py ./ref ./foreign ./output --foreign_lang jpn --forei
         action="store_true",
         help="Force the script to re-process and overwrite files that already exist in the output directory. Default is to skip them."
     )
+    parser.add_argument(
+        "--per_episode_csv",
+        action="store_true",
+        help="Write a per-episode segment CSV report ('<SxxExx>_segments.csv' in the output directory). "
+             "Do not pass --output_csv yourself in the pass-through args, as it would be overwritten by every episode."
+    )
 
     # This is the key to capturing all extra arguments for the child script
     args, unknown_args = parser.parse_known_args()
@@ -217,7 +223,10 @@ python AVSync_batch_regex.py ./ref ./foreign ./output --foreign_lang jpn --forei
             output_path,
             "--auto_detect",
         ] + unknown_args
-        
+        if args.per_episode_csv:
+            csv_path = os.path.join(args.output_dir, f"{pair_id}_segments.csv")
+            command += ["--output_csv", csv_path]
+
         print(f"  -> Executing: {' '.join(command)}")
 
         if run_sync_process(command):

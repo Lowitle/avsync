@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.vscode/
+avsync.code-workspace
+video_test/
+*_avsync.log
+test_log.txt
+.avsync_cache/

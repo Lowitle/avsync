@@ -239,6 +239,13 @@ def get_cache_key(args):
         'min_segment_duration': args.min_segment_duration,
         'ref_lang': args.ref_lang,
         'foreign_lang': args.foreign_lang,
+        'anchor_source': getattr(args, 'anchor_source', 'visual'),
+        'audio_anchor_window': getattr(args, 'audio_anchor_window', None),
+        'audio_anchor_step': getattr(args, 'audio_anchor_step', None),
+        'audio_anchor_min_confidence': getattr(args, 'audio_anchor_min_confidence', None),
+        'audio_anchor_search_radius': getattr(args, 'audio_anchor_search_radius', None),
+        'source_tempo': getattr(args, 'source_tempo', None),
+        'foreign_anchor_stream_idx': getattr(args, 'foreign_anchor_stream_idx', None),
     }
     
     cache_str = json.dumps(cache_params, sort_keys=True)
@@ -260,8 +267,14 @@ def get_cache_path(args):
 def save_checkpoint(cache_path, visual_anchors_details):
     """Save checkpoint data to disk"""
     checkpoint_data = {
-        'version': 14,
+        'version': 15,
         'visual_anchors_details': visual_anchors_details,
+        # Anchor pairing also derives this global state (gap-fill ranges, silence-based
+        # editorial edits); it must travel with the anchors or segment processing breaks
+        # when a cache hit skips run_audio_pairing_stage() entirely.
+        'audio_replacement_ranges': AUDIO_REPLACEMENT_RANGES,
+        'audio_editorial_edits': AUDIO_EDITORIAL_EDITS,
+        'audio_editorial_source_tempo': AUDIO_EDITORIAL_SOURCE_TEMPO,
         'timestamp': time.time()
     }
     
@@ -284,7 +297,7 @@ def load_checkpoint(cache_path):
         with open(cache_path, 'rb') as f:
             checkpoint_data = pickle.load(f)
         
-        if checkpoint_data.get('version') != 14:
+        if checkpoint_data.get('version') != 15:
             logger.warning(f"[CACHE] Version mismatch, ignoring cache")
             return None
             
@@ -453,14 +466,18 @@ MAX_ALLOWED_DURATION_PERCENT_DIFF = 6.0 # Max % difference allowed between ref/f
 MIN_DELAY_S = 0.001 # Minimum delay to apply padding
 DEFAULT_REF_LANG = "eng"
 DEFAULT_FOREIGN_LANG = "foreign" # Changed from "hin"
-DEFAULT_MUX_ACODEC = "aac"
-DEFAULT_MUX_ABITRATE = "192k"
+DEFAULT_MUX_ACODEC = "auto"
+DEFAULT_MUX_ABITRATE = "auto"
+DEFAULT_MUX_ABITRATE_FALLBACK = "192k"  # used only if source bitrate can't be detected
 QC_IMAGE_HEIGHT = 720
 FFMPEG_EXEC = None
 FFPROBE_EXEC = None
 MKVMERGE_EXEC = None
 MATCH_WINDOW_PERCENT = 0.06 # Percentage of ref video duration for INITIAL anchor search window
 ANCHOR_FOLLOW_FORWARD_WINDOW_S = 10.0 # Seconds forward from estimated position for subsequent matches
+AUDIO_REPLACEMENT_RANGES = [] # Reference intervals to fill from the reference audio when foreign content is missing
+AUDIO_EDITORIAL_EDITS = [] # Explicit source-timeline edits shared with subtitle retiming
+AUDIO_EDITORIAL_SOURCE_TEMPO = 1.0
 
 # Logger will be initialized in main() with proper file output
 # Use a temporary logger for early errors
@@ -973,6 +990,50 @@ def sync_additional_track(foreign_video, stream_idx, final_segment_anchors, ref_
     ]
     if not run_ffmpeg(extract_cmd, f"Extract Additional Track #{stream_idx}")[0]:
         return None
+
+    # Reuse the primary track's explicit editorial recipe when available. This
+    # keeps all foreign tracks on the same cut/insert timeline.
+    if AUDIO_EDITORIAL_EDITS:
+        try:
+            sample_rate, source_audio = wavfile.read(foreign_wav_full)
+            reference_wav = os.path.join(temp_dir, "ref_audio_full.wav")
+            if not os.path.exists(reference_wav):
+                logger.warning(f"  Editorial recipe skipped for track #{stream_idx}: reference WAV is unavailable")
+            else:
+                _, reference_audio = wavfile.read(reference_wav)
+                source_channels = source_audio.ndim == 2
+                reference_mono = (reference_audio.mean(axis=1)
+                                  if reference_audio.ndim == 2 else reference_audio)
+                corrected_channels = []
+                for channel in (source_audio.T if source_channels else [source_audio]):
+                    corrected_channels.append(_import_audio_alignment().apply_editorial_edit_recipe(
+                        source_audio=channel,
+                        reference_audio=reference_mono,
+                        edits=AUDIO_EDITORIAL_EDITS,
+                        sample_rate=sample_rate,
+                    ))
+                corrected_audio = (np.column_stack(corrected_channels)
+                                   if source_channels else corrected_channels[0])
+                recipe_wav = os.path.join(track_temp_dir, f"recipe_track_{stream_idx}.wav")
+                wavfile.write(recipe_wav, sample_rate, corrected_audio.astype(source_audio.dtype))
+                output_wav = os.path.join(track_temp_dir, f"synced_track_{stream_idx}.wav")
+                if ref_delay_s >= MIN_DELAY_S:
+                    delay_ms = int(ref_delay_s * 1000)
+                    pad_cmd = [
+                        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+                        "-i", recipe_wav,
+                        "-af", f"adelay={delay_ms}|{delay_ms}",
+                        "-c:a", "pcm_s16le", "-ar", str(DEFAULT_SAMPLE_RATE),
+                        "-ac", str(DEFAULT_CHANNELS), "-y", output_wav,
+                    ]
+                    if not run_ffmpeg(pad_cmd, f"Apply Editorial Padding to Track #{stream_idx}")[0]:
+                        shutil.copy2(recipe_wav, output_wav)
+                else:
+                    shutil.copy2(recipe_wav, output_wav)
+                logger.info(f"  [OK] Applied primary editorial recipe to track #{stream_idx}")
+                return output_wav
+        except Exception as e:
+            logger.warning(f"  Editorial recipe failed for track #{stream_idx}: {e}. Falling back to anchor segments.")
     
     # Step 2: Process each segment using the same anchors
     processed_segment_files = []
@@ -1013,9 +1074,21 @@ def sync_additional_track(foreign_video, stream_idx, final_segment_anchors, ref_
         if segment_path and os.path.exists(segment_path):
             processed_segment_files.append(segment_path)
         else:
-            pbar.close()
-            logger.error(f"  Failed to process segment {segment_num} for track #{stream_idx}")
-            return None
+            fallback_path = os.path.join(track_temp_dir, f"segment_{segment_num:04d}_fallback.wav")
+            logger.warning(f"  Segment {segment_num} for track #{stream_idx}: iterative processing failed. Activating direct segment fallback recovery.")
+            if fallback_direct_segment(
+                source_wav=foreign_wav_full,
+                source_start=foreign_start,
+                source_end=foreign_end,
+                out_path=fallback_path,
+                segment_num=segment_num,
+                label=f"track #{stream_idx} segment"
+            ):
+                processed_segment_files.append(fallback_path)
+            else:
+                pbar.close()
+                logger.error(f"  Failed to recover segment {segment_num} for track #{stream_idx}. Both iterative and direct fallback paths failed.")
+                return None
         
         pbar.update(1)
     
@@ -1143,18 +1216,15 @@ def extract_frames_ffmpeg(video_path, output_folder, scene_threshold):
     success, stderr_output = run_ffmpeg(ffmpeg_command, f"Extract Frames ({vid_name})", verbose_success=False, capture_stderr=True)
 
     if success and stderr_output:
-        # Regex to find pts_time in showinfo output
-        pts_time_re = re.compile(r'n:\s*\d+\s+pts:\s*\d+\s+pts_time:(\d+\.?\d*)')
-        lines = stderr_output.splitlines()
-        for line in lines:
-            # Filter for the specific showinfo log lines
-            if '[Parsed_showinfo' in line and 'pts_time:' in line:
-                 match = pts_time_re.search(line)
-                 if match:
-                     try:
-                         parsed_pts_times.append(float(match.group(1)))
-                     except (ValueError, IndexError):
-                         logger.warning(f"Could not parse pts_time from line: {line}")
+        # Scan the raw text directly (not split by '\n' first): splitting first requires the
+        # whole "n: ... pts: ... pts_time:..." triple to land intact on one line-break-derived
+        # line, which silently drops most entries if anything reflows/interleaves that text.
+        pts_time_re = re.compile(r'\[Parsed_showinfo[^\]]*\][^\n]*?pts_time:([-\d.]+)')
+        for match in pts_time_re.finditer(stderr_output):
+            try:
+                parsed_pts_times.append(float(match.group(1)))
+            except (ValueError, IndexError):
+                logger.warning(f"Could not parse pts_time from match: {match.group(0)}")
     elif not success:
         logger.error(f"  Frame extraction command failed for {vid_name}.")
         return False, [], []
@@ -1170,7 +1240,10 @@ def extract_frames_ffmpeg(video_path, output_folder, scene_threshold):
 
     final_count = 0
     if frame_count != timestamp_count:
-         logger.warning(f"  Frame/Timestamp count mismatch ({frame_count} frames vs {timestamp_count} timestamps) for {vid_name}. Using minimum.")
+         # A large gap almost always means the pts_time parser dropped valid entries, not that
+         # ffmpeg actually produced fewer timestamps than frames - flag it loudly, not as a warning.
+         log_fn = logger.error if timestamp_count < frame_count * 0.9 else logger.warning
+         log_fn(f"  Frame/Timestamp count mismatch ({frame_count} frames vs {timestamp_count} timestamps) for {vid_name}. Using minimum.")
          final_count = min(frame_count, timestamp_count)
          # Trim lists to the minimum count to maintain correspondence
          parsed_pts_times = parsed_pts_times[:final_count]
@@ -1181,6 +1254,29 @@ def extract_frames_ffmpeg(video_path, output_folder, scene_threshold):
     logger.info(f"> Extracted {final_count} scene frames from {vid_name}")
     return True, [os.path.basename(f) for f in frame_files], parsed_pts_times
 
+def _prepare_frame_for_matching(gray_frame):
+    """Letterbox-resize to RESIZE_WIDTH x RESIZE_HEIGHT preserving aspect ratio, then mild blur.
+
+    Stretching to a fixed size (ignoring the source's real aspect ratio) and comparing
+    raw pixels directly is fragile when one source has a much lower resolution/heavier
+    compression than the other (e.g. non-16:9 SD source vs sharp 1080p reference) -
+    template matching scores collapse even for genuinely matching scenes.
+    """
+    if gray_frame is None or gray_frame.size == 0:
+        return None
+    h, w = gray_frame.shape[:2]
+    if h == 0 or w == 0:
+        return None
+    scale = min(RESIZE_WIDTH / w, RESIZE_HEIGHT / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(gray_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((RESIZE_HEIGHT, RESIZE_WIDTH), dtype=resized.dtype)
+    y_off = (RESIZE_HEIGHT - new_h) // 2
+    x_off = (RESIZE_WIDTH - new_w) // 2
+    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return cv2.GaussianBlur(canvas, (3, 3), 0)
+
 def process_image_pair_for_match(ref_img_name, foreign_image_list, ref_extract_folder, foreign_extract_folder, match_threshold):
     """Compares one reference image against a list of foreign images using template matching."""
     ref_img_path = os.path.join(ref_extract_folder, ref_img_name)
@@ -1189,7 +1285,7 @@ def process_image_pair_for_match(ref_img_name, foreign_image_list, ref_extract_f
         ref_frame_orig = cv2.imread(ref_img_path, cv2.IMREAD_GRAYSCALE)
         if ref_frame_orig is None:
             logger.warning(f"Could not read reference image: {ref_img_name}"); return None
-        ref_frame_comp = cv2.resize(ref_frame_orig, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+        ref_frame_comp = _prepare_frame_for_matching(ref_frame_orig)
         if ref_frame_comp is None or ref_frame_comp.size == 0:
              logger.warning(f"Failed to resize reference image: {ref_img_name}"); return None
     except Exception as e:
@@ -1205,7 +1301,7 @@ def process_image_pair_for_match(ref_img_name, foreign_image_list, ref_extract_f
             # Read, grayscale, and resize foreign image
             foreign_frame_orig = cv2.imread(foreign_img_path, cv2.IMREAD_GRAYSCALE)
             if foreign_frame_orig is None: continue # Skip if image can't be read
-            foreign_frame_comp = cv2.resize(foreign_frame_orig, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+            foreign_frame_comp = _prepare_frame_for_matching(foreign_frame_orig)
             if foreign_frame_comp is None or foreign_frame_comp.size == 0: continue # Skip if resize fails
 
             # Perform template matching
@@ -1434,7 +1530,7 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
         try:
             img = cv2.imread(f_path, cv2.IMREAD_GRAYSCALE)
             if img is not None:
-                resized = cv2.resize(img, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+                resized = _prepare_frame_for_matching(img)
                 if resized is not None and resized.size > 0:
                     foreign_frame_cache[f_name] = resized
                 else:
@@ -1477,7 +1573,7 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
             if ref_img is None:
                 skipped_count += 1
                 continue
-            ref_frame_comp = cv2.resize(ref_img, (RESIZE_WIDTH, RESIZE_HEIGHT), interpolation=cv2.INTER_AREA)
+            ref_frame_comp = _prepare_frame_for_matching(ref_img)
             if ref_frame_comp is None or ref_frame_comp.size == 0:
                 skipped_count += 1
                 continue
@@ -1585,6 +1681,737 @@ def run_image_pairing_stage(ref_video_path, foreign_video_path, temp_dir, scene_
     return visual_anchors_details # Return list of detailed anchor tuples
 
 
+# --- Audio Anchor Pairing (fallback for video pairs where template matching is unreliable) ---
+
+def get_video_fps(video_path):
+    """Return the primary video stream's frame rate as a float using ffprobe.
+
+    Uses avg_frame_rate rather than r_frame_rate: for VFR-flagged AVI/Xvid content,
+    r_frame_rate can report a bogus "least common multiple" value (e.g. 21845/911)
+    instead of the actual nominal rate, while avg_frame_rate reflects real playback speed.
+    """
+    global FFPROBE_EXEC
+    try:
+        result = subprocess.run(
+            [FFPROBE_EXEC, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+             "-of", "default=noprint_wrappers=1", video_path],
+            capture_output=True, text=True, check=True, timeout=30)
+        rates = {}
+        for line in result.stdout.strip().splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                rates[key.strip()] = value.strip()
+
+        def _parse(rate_str):
+            if not rate_str or rate_str == "0/0":
+                return None
+            if "/" in rate_str:
+                num, den = rate_str.split("/")
+                den_f = float(den)
+                return float(num) / den_f if den_f != 0 else None
+            return float(rate_str)
+
+        return _parse(rates.get("avg_frame_rate")) or _parse(rates.get("r_frame_rate"))
+    except Exception as e:
+        logger.warning(f"Could not determine fps for {os.path.basename(video_path)}: {e}")
+        return None
+
+
+def compute_auto_source_tempo(ref_video, foreign_video):
+    """Return the global source-to-reference speed factor from effective video FPS.
+
+    ``avg_frame_rate`` is preferred by ``get_video_fps`` because some AVI/Xvid
+    files expose an unusable ``r_frame_rate`` value. The returned factor is
+    used only to normalize the source timeline before audio comparison.
+    """
+    ref_fps = get_video_fps(ref_video)
+    foreign_fps = get_video_fps(foreign_video)
+    if not ref_fps or not foreign_fps:
+        logger.warning("  Could not auto-detect effective FPS for global normalization; using factor=1.0.")
+        return 1.0
+    tempo = ref_fps / foreign_fps
+    logger.info(f"  Global FPS normalization: source {foreign_fps:.6f} -> reference {ref_fps:.6f} (factor={tempo:.9f})")
+    return tempo
+
+
+def resolve_anchor_stream_indices(args):
+    """Resolve the original-audio stream indices used for anchor detection."""
+    ref_idx = args.ref_stream_idx
+    if ref_idx is None:
+        ref_idx = find_audio_stream_index_by_lang(get_stream_info(args.ref_video), args.ref_lang)
+    foreign_idx = getattr(args, 'foreign_anchor_stream_idx', None)
+    if foreign_idx is None:
+        # Backward compatibility: before the roles were separated, the primary
+        # foreign track was also used as the audio anchor stream.
+        foreign_idx = args.foreign_stream_idx
+    if foreign_idx is None:
+        foreign_idx = find_audio_stream_index_by_lang(get_stream_info(args.foreign_video), args.foreign_lang)
+    return ref_idx, foreign_idx
+
+
+def _import_audio_alignment():
+    """Import the sibling audio_alignment module regardless of the current working directory."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    import audio_alignment as aa
+    return aa
+
+
+def _direct_similarity(a, b):
+    """Zero-lag normalized similarity between two equal-length audio arrays."""
+    a = a.astype(np.float64); a = a - a.mean()
+    b = b.astype(np.float64); b = b - b.mean()
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom < 1e-9:
+        return -1.0
+    return float(np.dot(a, b) / denom)
+
+
+def _locate_transition_point(reference, source, sample_rate, ref_lo, ref_hi,
+                              offset_before, offset_after,
+                              probe_window_seconds=1.0, precision_seconds=0.02, max_iterations=25):
+    """Binary-search the exact reference time where content switches from offset_before
+    to offset_after, so only that instant needs correcting instead of stretching the
+    whole (often 30-120s) window between two coarse audio anchors.
+
+    The probe window shrinks as the search narrows: a wide window is more robust for the
+    first few iterations (far from the boundary), but a window comparable to or larger than
+    the remaining [lo, hi] gap biases the result by up to half the window size, since it then
+    straddles content from both sides of the true transition.
+    """
+    def _matches_before(probe_ref_time, window_samples):
+        ref_start = int(probe_ref_time * sample_rate)
+        ref_end = ref_start + window_samples
+        if ref_start < 0 or ref_end > len(reference):
+            return None
+        probe = reference[ref_start:ref_end]
+
+        def _score(offset):
+            src_start = int((probe_ref_time + offset) * sample_rate)
+            src_end = src_start + window_samples
+            if src_start < 0 or src_end > len(source):
+                return -1.0
+            return _direct_similarity(probe, source[src_start:src_end])
+
+        score_before = _score(offset_before)
+        score_after = _score(offset_after)
+        if score_before < 0.15 and score_after < 0.15:
+            return None  # inconclusive (e.g. silence at this probe point)
+        return score_before >= score_after
+
+    lo, hi = ref_lo, ref_hi
+    for _ in range(max_iterations):
+        gap = hi - lo
+        if gap <= precision_seconds:
+            break
+        window_seconds = max(0.05, min(probe_window_seconds, gap / 3.0))
+        window_samples = int(window_seconds * sample_rate)
+        mid = (lo + hi) / 2.0
+        matches_before = _matches_before(mid, window_samples)
+        if matches_before is None:
+            break  # inconclusive at this probe; keep current [lo, hi] bounds
+        if matches_before:
+            lo = mid
+        else:
+            hi = mid
+
+    return (lo + hi) / 2.0
+
+
+def _measure_local_audio_offset(reference, source, aa, sample_rate, ref_time,
+                                expected_offset, window_seconds=8.0,
+                                search_radius_seconds=8.0):
+    """Measure one short local offset without relying on coarse anchor spacing."""
+    window_samples = int(window_seconds * sample_rate)
+    ref_start = max(0, int(ref_time * sample_rate))
+    ref_end = min(len(reference), ref_start + window_samples)
+    reference_window = reference[ref_start:ref_end]
+    if len(reference_window) < window_samples // 2:
+        return None
+
+    expected_source_start = ref_time + expected_offset
+    search_start = max(0, int((expected_source_start - search_radius_seconds) * sample_rate))
+    search_end = min(len(source), int((expected_source_start + window_seconds + search_radius_seconds) * sample_rate))
+    source_search = source[search_start:search_end]
+    if len(source_search) < len(reference_window):
+        return None
+
+    try:
+        waveform_offset, waveform_confidence = aa.correlate_offset(
+            reference_window, source_search, sample_rate)
+        envelope_offset, envelope_confidence = aa.correlate_envelope_offset(
+            reference_window, source_search, sample_rate)
+    except ValueError:
+        return None
+
+    search_start_seconds = search_start / sample_rate
+    waveform_offset += search_start_seconds - ref_time
+    envelope_offset += search_start_seconds - ref_time
+    if max(waveform_confidence, envelope_confidence) < 2.0:
+        return None
+    if (waveform_confidence >= 2.0 and envelope_confidence >= 2.0
+            and abs(waveform_offset - envelope_offset) > 0.15):
+        return None
+    return (envelope_offset, envelope_confidence) if envelope_confidence >= waveform_confidence else (waveform_offset, waveform_confidence)
+
+
+def _progressive_offset_probes(reference, source, aa, sample_rate, ref_lo, ref_hi,
+                               offset_lo, offset_hi, jump_tolerance_seconds,
+                               min_interval_seconds=2.0, max_depth=8):
+    """Recursively probe a suspect interval until an offset change is localized."""
+    probes = [(ref_lo, offset_lo), (ref_hi, offset_hi)]
+
+    def subdivide(lo, hi, left_offset, right_offset, depth):
+        if depth >= max_depth or hi - lo <= min_interval_seconds:
+            return
+        mid = (lo + hi) / 2.0
+        expected_offset = (left_offset + right_offset) / 2.0
+        measurement = _measure_local_audio_offset(
+            reference, source, aa, sample_rate, mid, expected_offset)
+        if measurement is None:
+            return
+        mid_offset, _ = measurement
+        probes.append((mid, mid_offset))
+        if abs(mid_offset - left_offset) > jump_tolerance_seconds:
+            subdivide(lo, mid, left_offset, mid_offset, depth + 1)
+        if abs(right_offset - mid_offset) > jump_tolerance_seconds:
+            subdivide(mid, hi, mid_offset, right_offset, depth + 1)
+
+    subdivide(ref_lo, ref_hi, offset_lo, offset_hi, 0)
+    return sorted(probes)
+
+
+def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, foreign_stream_idx,
+                            source_tempo, window_seconds, step_seconds, min_confidence,
+                            search_radius_seconds=20.0, agreement_seconds=0.15, jump_tolerance_seconds=0.15,
+                            anchor_report_csv=None):
+    """Generate sync anchors via audio cross-correlation instead of visual frame matching.
+
+    Intended for pairs where resolution/compression/aspect-ratio mismatch makes template
+    matching unreliable (e.g. an SD Xvid source vs an HEVC 1080p reference). Returns anchors
+    in the same (ref_name, foreign_name, ref_time, foreign_time) tuple format produced by
+    run_image_pairing_stage, so they flow through the existing filtering/sync pipeline unchanged.
+    """
+    global AUDIO_EDITORIAL_SOURCE_TEMPO
+    aa = _import_audio_alignment()
+    sample_rate = aa.DEFAULT_SAMPLE_RATE
+    AUDIO_REPLACEMENT_RANGES.clear()
+    AUDIO_EDITORIAL_EDITS.clear()
+
+    logger.info("\n===== Audio Anchor Pairing Stage =====")
+    stage_start_time = time.time()
+    logger.info(f"  Ref stream: #{ref_stream_idx}, Foreign stream: #{foreign_stream_idx}, Source tempo: {source_tempo:.6f}")
+    logger.info(f"  Window: {window_seconds:.1f}s, Step: {step_seconds:.1f}s, Min confidence: {min_confidence:.1f}, Search radius: {search_radius_seconds:.1f}s")
+
+    logger.info("  -> Extracting full reference audio for anchor analysis (with loudness normalization)...")
+    reference = aa.extract_mono_audio(ref_video_path, ref_stream_idx, sample_rate, normalize_loudness=True)
+    logger.info("  -> Extracting full foreign audio (tempo-corrected) for anchor analysis (with loudness normalization)...")
+    source = aa.extract_mono_audio(foreign_video_path, foreign_stream_idx, sample_rate, tempo=source_tempo, normalize_loudness=True)
+
+    window_samples = int(window_seconds * sample_rate)
+    step_samples = max(1, int(step_seconds * sample_rate))
+    if len(reference) < window_samples:
+        logger.error("  Reference audio shorter than one analysis window; cannot generate audio anchors.")
+        return None
+
+    anchors = []
+    anchor_offsets = []  # tempo-corrected offset used for each accepted anchor, parallel to `anchors`
+    candidate_measurements = []
+    expected_offset = 0.0
+    have_confirmed_baseline = False
+    num_windows = max(1, (len(reference) - window_samples) // step_samples + 1)
+    progress_bar = tqdm(total=num_windows, desc="  Scanning Audio Anchors", unit="window", ncols=100, leave=False)
+
+    for ref_start in range(0, len(reference) - window_samples + 1, step_samples):
+        progress_bar.update(1)
+        ref_end = ref_start + window_samples
+        reference_window = reference[ref_start:ref_end]
+        ref_time = ref_start / sample_rate
+
+        expected_source_start = ref_time + expected_offset
+        search_start = max(0, int((expected_source_start - search_radius_seconds) * sample_rate))
+        search_end = min(len(source), int((expected_source_start + window_seconds + search_radius_seconds) * sample_rate))
+        source_search = source[search_start:search_end]
+        if len(source_search) < window_samples:
+            continue
+
+        try:
+            waveform_offset, waveform_confidence = aa.correlate_offset(reference_window, source_search, sample_rate)
+            envelope_offset, envelope_confidence = aa.correlate_envelope_offset(reference_window, source_search, sample_rate)
+        except ValueError:
+            continue
+
+        search_start_seconds = search_start / sample_rate
+        waveform_offset += search_start_seconds - ref_time
+        envelope_offset += search_start_seconds - ref_time
+
+        candidate_measurements.append((
+            ref_time,
+            envelope_offset if envelope_confidence >= waveform_confidence else waveform_offset,
+            waveform_offset,
+            envelope_offset,
+            waveform_confidence,
+            envelope_confidence,
+        ))
+
+        best_confidence = max(waveform_confidence, envelope_confidence)
+        candidate_offset = envelope_offset if envelope_confidence >= waveform_confidence else waveform_offset
+        # A window too weak to accept on its own correlation strength can still be trusted if
+        # its offset lands almost exactly where the already-confirmed constant (FPS-corrected)
+        # speed predicts it should be - that coincidence is itself strong corroborating evidence,
+        # and it's exactly the kind of low-confidence window that otherwise leaves large gaps
+        # between accepted anchors (e.g. a quiet passage within an otherwise matching stretch).
+        offset_matches_baseline = (
+            have_confirmed_baseline
+            and abs(candidate_offset - expected_offset) <= agreement_seconds
+        )
+        relaxed_min_confidence = max(1.0, min_confidence * 0.5)
+        if best_confidence < min_confidence:
+            if not (offset_matches_baseline and best_confidence >= relaxed_min_confidence):
+                continue
+        both_reliable = waveform_confidence >= min_confidence and envelope_confidence >= min_confidence
+        if best_confidence >= min_confidence and both_reliable and abs(waveform_offset - envelope_offset) > agreement_seconds:
+            logger.debug(f"    Window {ref_time:.1f}s: waveform/envelope disagree ({waveform_offset:.3f}s vs {envelope_offset:.3f}s), skipping.")
+            continue
+
+        if envelope_confidence >= waveform_confidence:
+            offset, method = envelope_offset, "envelope"
+        else:
+            offset, method = waveform_offset, "waveform"
+        if best_confidence < min_confidence:
+            method += " offset-consistency"
+        else:
+            have_confirmed_baseline = True
+
+        # offset/source_time are in the tempo-corrected timeline; map back to the real foreign audio timeline.
+        # offset is positive when the foreign audio lags the reference, so the matching
+        # foreign position is LATER by that amount: source_time = ref_time + offset.
+        tempo_corrected_source_time = ref_time + offset
+        if tempo_corrected_source_time < 0:
+            continue
+        foreign_time = tempo_corrected_source_time * source_tempo
+
+        anchor_name = f"AUDIO_ANCHOR_{len(anchors)+1:04d}"
+        anchors.append((f"{anchor_name}_ref", f"{anchor_name}_foreign", ref_time, foreign_time))
+        anchor_offsets.append(offset)
+        expected_offset = offset
+        logger.info(f"  Anchor: ref {ref_time:.1f}s -> foreign {foreign_time:.1f}s (offset {offset:+.3f}s, {method}, conf {best_confidence:.2f})")
+
+    progress_bar.close()
+
+    # A long editorially different opening can make individual 30-60 second
+    # windows look ambiguous even though several later windows agree on the
+    # same offset. Recover that stable consensus without accepting isolated
+    # correlation peaks as anchors.
+    consensus_candidates = [
+        item for item in candidate_measurements
+        if max(item[4], item[5]) >= 1.1
+        and abs(item[2] - item[3]) <= agreement_seconds
+    ]
+    if len(consensus_candidates) >= 3:
+        consensus_offset = float(np.median([item[1] for item in consensus_candidates]))
+        consensus_anchors = []
+        for item in consensus_candidates:
+            if abs(item[1] - consensus_offset) > 0.35:
+                continue
+            ref_time, offset = item[0], item[1]
+            foreign_time = (ref_time + offset) * source_tempo
+            if foreign_time < 0:
+                continue
+            consensus_anchors.append((
+                f"AUDIO_CONSENSUS_{len(consensus_anchors)+1:04d}_ref",
+                f"AUDIO_CONSENSUS_{len(consensus_anchors)+1:04d}_foreign",
+                ref_time,
+                foreign_time,
+            ))
+        if len(consensus_anchors) > len(anchors):
+            anchors = consensus_anchors
+            anchor_offsets = [item[1] for item in consensus_candidates
+                              if abs(item[1] - consensus_offset) <= 0.35
+                              and (item[0] + item[1]) * source_tempo >= 0]
+            logger.info(
+                f"  Consensus recovery: retained {len(anchors)} anchors around "
+                f"offset {consensus_offset:+.3f}s from {len(consensus_candidates)} "
+                "concordant windows"
+            )
+
+    stage_elapsed_time = time.time() - stage_start_time
+    if not anchors:
+        logger.error("  No audio anchors passed confidence/agreement thresholds.")
+        return None
+
+    first_full_anchor = min(anchors, key=lambda item: item[2])
+    last_full_anchor = anchors[-1]
+    last_full_anchor_offset = anchor_offsets[-1]
+    if first_full_anchor[2] > window_seconds * 0.5:
+        partial_anchor = aa.find_partial_anchor(
+            reference,
+            source,
+            sample_rate,
+            reference_end=first_full_anchor[2],
+            source_end=first_full_anchor[3] / source_tempo,
+            window_seconds=min(2.0, window_seconds / 10.0),
+            step_seconds=0.5,
+            search_radius_seconds=8.0,
+            min_confidence=1.5,
+            agreement_seconds=0.2,
+            min_consistent_matches=2,
+        )
+        if partial_anchor is not None and partial_anchor.reference_time < first_full_anchor[2]:
+            partial_foreign_time = partial_anchor.source_time * source_tempo
+            anchors.insert(0, (
+                "AUDIO_PARTIAL_0001_ref",
+                "AUDIO_PARTIAL_0001_foreign",
+                partial_anchor.reference_time,
+                partial_foreign_time,
+            ))
+            anchor_offsets.insert(0, partial_anchor.offset_seconds)
+            logger.info(
+                f"  Partial anchor recovered: ref {partial_anchor.reference_time:.3f}s -> "
+                f"foreign {partial_foreign_time:.3f}s (offset {partial_anchor.offset_seconds:+.3f}s, "
+                f"confidence {partial_anchor.confidence:.2f})"
+            )
+
+    # Symmetric recovery at the tail end: the last accepted full-window anchor can sit
+    # well before the true end of the content (e.g. an editorially different closing
+    # stretch), leaving the final segment stretched across a much larger gap than any
+    # other segment and prone to audible drift in its last seconds. Search the interval
+    # after the last anchor for the LATEST short fragment that still matches, using the
+    # last anchor's offset (not zero) as the search center since drift may have accumulated.
+    reference_total_duration = len(reference) / sample_rate
+    source_total_duration = len(source) / sample_rate
+    if reference_total_duration - last_full_anchor[2] > window_seconds * 0.5:
+        partial_end_anchor = aa.find_partial_anchor(
+            reference,
+            source,
+            sample_rate,
+            reference_start=last_full_anchor[2],
+            reference_end=reference_total_duration,
+            source_end=source_total_duration,
+            expected_offset=last_full_anchor_offset,
+            window_seconds=min(2.0, window_seconds / 10.0),
+            step_seconds=0.5,
+            search_radius_seconds=8.0,
+            min_confidence=1.5,
+            agreement_seconds=0.2,
+            min_consistent_matches=2,
+            prefer='latest',
+        )
+        if partial_end_anchor is not None and partial_end_anchor.reference_time > last_full_anchor[2]:
+            partial_end_foreign_time = partial_end_anchor.source_time * source_tempo
+            anchors.append((
+                "AUDIO_PARTIAL_END_0001_ref",
+                "AUDIO_PARTIAL_END_0001_foreign",
+                partial_end_anchor.reference_time,
+                partial_end_foreign_time,
+            ))
+            anchor_offsets.append(partial_end_anchor.offset_seconds)
+            logger.info(
+                f"  Partial end-anchor recovered: ref {partial_end_anchor.reference_time:.3f}s -> "
+                f"foreign {partial_end_foreign_time:.3f}s (offset {partial_end_anchor.offset_seconds:+.3f}s, "
+                f"confidence {partial_end_anchor.confidence:.2f})"
+            )
+
+    # Densify large stable gaps: a wide span between two anchors that broadly agree on offset
+    # is usually safe to stretch smoothly, but relying on a single 60-120s atempo pass over it
+    # is fragile if correlation confidence was only marginal throughout. Recover extra confirmed
+    # short-window anchors near both edges of any such gap, using the same run-based scan
+    # already used to reach the head/tail.
+    densify_gap_threshold = step_seconds * 2.0
+    short_window = min(2.0, window_seconds / 10.0)
+    new_densify_anchors = []
+    for i in range(len(anchors) - 1):
+        ref_lo, offset_lo = anchors[i][2], anchor_offsets[i]
+        ref_hi, offset_hi = anchors[i + 1][2], anchor_offsets[i + 1]
+        if ref_hi - ref_lo <= densify_gap_threshold or abs(offset_hi - offset_lo) > jump_tolerance_seconds:
+            continue
+        found_candidates = []
+        for label, prefer, expected in (("a", "earliest", offset_lo), ("b", "latest", offset_hi)):
+            found = aa.find_partial_anchor(
+                reference, source, sample_rate,
+                reference_start=ref_lo, reference_end=ref_hi,
+                source_end=source_total_duration,
+                expected_offset=expected,
+                window_seconds=short_window, step_seconds=0.5,
+                search_radius_seconds=8.0, min_confidence=1.5,
+                agreement_seconds=0.2, min_consistent_matches=2,
+                prefer=prefer,
+            )
+            if found is None or found.reference_time <= ref_lo + 1.0 or found.reference_time >= ref_hi - 1.0:
+                continue
+            if found_candidates and abs(found.reference_time - found_candidates[0][1].reference_time) <= short_window * 2.0:
+                continue  # same run already found from the other edge
+            found_candidates.append((label, found))
+        for label, found in found_candidates:
+            foreign_time = found.source_time * source_tempo
+            new_densify_anchors.append((found.reference_time, f"AUDIO_DENSIFY_{i+1:04d}{label}", foreign_time, found.offset_seconds))
+            logger.info(
+                f"  Densified gap {ref_lo:.1f}s-{ref_hi:.1f}s: recovered anchor at ref {found.reference_time:.3f}s -> "
+                f"foreign {foreign_time:.3f}s (offset {found.offset_seconds:+.3f}s, confidence {found.confidence:.2f})"
+            )
+    for ref_time, name, foreign_time, offset in sorted(new_densify_anchors, key=lambda item: item[0]):
+        insert_at = next((idx for idx, a in enumerate(anchors) if a[2] > ref_time), len(anchors))
+        anchors.insert(insert_at, (f"{name}_ref", f"{name}_foreign", ref_time, foreign_time))
+        anchor_offsets.insert(insert_at, offset)
+
+    silence_differences = aa.compare_silence_profiles(
+        reference,
+        source,
+        sample_rate,
+        # Piecewise offset per anchor, not just the first one - offset drifts across the file,
+        # and a single global value misses real silence differences wherever it's stale.
+        offset=list(zip((anchor[2] for anchor in anchors), anchor_offsets)),
+        threshold_db=-40.0,
+        min_duration=0.2,
+        tolerance_seconds=0.25,
+    )
+    if silence_differences:
+        logger.info(f"  Detected {len(silence_differences)} candidate silence difference(s) after FPS normalization.")
+        editorial_edits = aa.build_editorial_edit_recipe(silence_differences, source_tempo=source_tempo)
+        AUDIO_EDITORIAL_EDITS.extend(editorial_edits)
+        AUDIO_EDITORIAL_SOURCE_TEMPO = source_tempo
+        logger.info(f"  Built {len(editorial_edits)} editorial edit(s) for Source-Audio recipe application.")
+        for difference in silence_differences:
+            logger.info(
+                f"  Silence candidate: Reference {difference.reference_start:.3f}s-"
+                f"{difference.reference_end:.3f}s, Source "
+                f"{difference.source_start:.3f}s-{difference.source_end:.3f}s, "
+                f"Source silence is {difference.kind.replace('_', ' ')} by "
+                f"{abs(difference.duration_difference):.3f}s"
+            )
+        for edit in editorial_edits:
+            logger.info(
+                f"  Editorial edit: {edit.operation} @ Source {edit.source_start:.3f}s-"
+                f"{edit.source_end:.3f}s, Reference {edit.reference_position:.3f}s, "
+                f"shift={edit.cumulative_shift_seconds:+.3f}s, reason={edit.reason}"
+            )
+        corrected_source = aa.apply_editorial_edit_recipe(
+            source_audio=source,
+            reference_audio=reference,
+            edits=editorial_edits,
+            sample_rate=sample_rate,
+        )
+        logger.info(
+            f"  Applied the editorial recipe to the Source signal: "
+            f"{len(source)/sample_rate:.3f}s -> {len(corrected_source)/sample_rate:.3f}s"
+        )
+    else:
+        logger.info("  No significant matched silence-duration differences detected.")
+
+    logger.info(f"---=== Audio Anchor Pairing Stage Finished ({stage_elapsed_time:.2f}s). Generated {len(anchors)} audio anchors ===---")
+
+    # --- Refinement: locate precise transition points for abrupt offset jumps ---
+    # A large, sudden offset change between consecutive anchors usually means a real editorial
+    # difference (extra/missing shot), not gradual drift. Left alone, the generic segment
+    # stretcher smears that jump across the whole 30-120s window between anchors, audibly
+    # changing pace/pitch throughout. Instead, pinpoint the exact instant and bracket it with
+    # a pair of anchors a few tens of milliseconds apart so only that near-instant absorbs the jump.
+    refined_anchors = list(anchors)
+    transition_count = 0
+
+    # The first accepted window may be well after the first editorial cut. Use
+    # the beginning of the extracted timelines as the initial offset instead of
+    # stretching the entire pre-anchor interval.
+    initial_offset = anchors[0][3] / source_tempo - anchors[0][2]
+    initial_jump = anchor_offsets[0] - initial_offset
+    first_ref_time = anchors[0][2]
+    if initial_offset < -jump_tolerance_seconds:
+        # The first anchor can be correct while the reference has a short prefix
+        # that is absent from the foreign recording. Preserve that prefix instead
+        # of stretching the whole first stable interval to reach the anchor.
+        content_start_index = np.flatnonzero(np.abs(reference) > 1e-4)
+        reference_content_start = (content_start_index[0] / sample_rate
+                                   if len(content_start_index) else 0.0)
+        replacement_start = reference_content_start
+        replacement_end = min(first_ref_time, replacement_start - initial_offset)
+        if replacement_end - replacement_start > jump_tolerance_seconds:
+            transition_count += 1
+            replacement_id = f"AUDIO_REPLACEMENT_{transition_count:04d}"
+            # Copying HQ reference content only makes sense if the cut point is a
+            # natural pause; otherwise it would hard-cut mid-note/mid-phrase.
+            use_silence = not aa.is_safe_splice_point(reference, sample_rate, replacement_end)
+            AUDIO_REPLACEMENT_RANGES.append({
+                "id": replacement_id,
+                "ref_start": replacement_start,
+                "ref_end": replacement_end,
+                "use_silence": use_silence,
+            })
+            replacement_foreign_time = 0.0
+            refined_anchors.append((f"{replacement_id}_a_ref", f"{replacement_id}_a_foreign",
+                                     replacement_start, replacement_foreign_time))
+            refined_anchors.append((f"{replacement_id}_b_ref", f"{replacement_id}_b_foreign",
+                                     replacement_end, replacement_foreign_time))
+            fill_desc = "silence (unsafe mid-content splice point)" if use_silence else "reference audio"
+            logger.info(f"  Located early missing foreign prefix at ref {replacement_start:.3f}s-"
+                        f"{replacement_end:.3f}s (initial offset {initial_offset:+.3f}s) -> "
+                        f"filling it with {fill_desc} instead of stretching the first segment")
+    elif abs(initial_jump) > jump_tolerance_seconds:
+        transition_ref_time = _locate_transition_point(
+            reference, source, sample_rate, 0.0, first_ref_time,
+            initial_offset, anchor_offsets[0])
+        if initial_jump < 0:
+            missing_ref_duration = abs(initial_jump)
+            replacement_start = transition_ref_time
+            replacement_end = replacement_start + missing_ref_duration
+            if replacement_start > 0.0 and replacement_end < first_ref_time:
+                transition_count += 1
+                replacement_id = f"AUDIO_REPLACEMENT_{transition_count:04d}"
+                use_silence = not aa.is_safe_splice_point(reference, sample_rate, replacement_end)
+                AUDIO_REPLACEMENT_RANGES.append({
+                    "id": replacement_id,
+                    "ref_start": replacement_start,
+                    "ref_end": replacement_end,
+                    "use_silence": use_silence,
+                })
+                replacement_foreign_time = (replacement_start + initial_offset) * source_tempo
+                refined_anchors.append((f"{replacement_id}_a_ref", f"{replacement_id}_a_foreign",
+                                         replacement_start, replacement_foreign_time))
+                refined_anchors.append((f"{replacement_id}_b_ref", f"{replacement_id}_b_foreign",
+                                         replacement_end, replacement_foreign_time))
+                fill_desc = "silence (unsafe mid-content splice point)" if use_silence else "reference audio"
+                logger.info(f"  Located early missing foreign interval at ref {replacement_start:.3f}s-"
+                            f"{replacement_end:.3f}s (jump {initial_jump:+.3f}s) -> "
+                            f"filling it with {fill_desc} instead of stretching the first segment")
+
+    progressive_candidates = []
+    progressive_intervals = [(0.0, anchors[0][2], initial_offset, anchor_offsets[0])]
+    progressive_intervals.extend(
+        (anchors[i][2], anchors[i + 1][2], anchor_offsets[i], anchor_offsets[i + 1])
+        for i in range(len(anchors) - 1)
+    )
+    # Mirror the head interval: the tail beyond the last anchor was never probed at all,
+    # so an offset drift/jump in the closing stretch (e.g. a differently-edited ending)
+    # silently got smeared across the whole final segment instead of being localized.
+    progressive_intervals.append(
+        (anchors[-1][2], reference_total_duration, anchor_offsets[-1], anchor_offsets[-1])
+    )
+    for interval_start, interval_end, interval_offset_start, interval_offset_end in progressive_intervals:
+        probes = _progressive_offset_probes(
+            reference, source, aa, sample_rate,
+            interval_start, interval_end,
+            interval_offset_start, interval_offset_end,
+            jump_tolerance_seconds,
+        )
+        if any(abs(right_offset - left_offset) > jump_tolerance_seconds
+               for (_, left_offset), (_, right_offset) in zip(probes, probes[1:])):
+            progressive_candidates.append(
+                (interval_start, interval_end, interval_offset_start, interval_offset_end))
+
+    for ref_time_i, ref_time_j, offset_i, offset_j in progressive_candidates:
+
+        # The next accepted anchor already measures the new state. Searching
+        # beyond it allowed the old binary search to drift toward the midpoint
+        # of an unrelated extra window (e.g. reporting 750s for a cut at 720s).
+        search_hi = min(ref_time_j, len(reference) / sample_rate)
+        transition_ref_time = _locate_transition_point(
+            reference, source, sample_rate, ref_time_i, search_hi, offset_i, offset_j)
+
+        delta = (offset_j - offset_i) * source_tempo
+        before_foreign_time = (transition_ref_time + offset_i) * source_tempo
+
+        # A negative jump means the foreign timeline moves backwards: the foreign
+        # edit is missing a piece that exists in the reference. Represent that
+        # missing piece as a real segment, to be filled from the reference audio.
+        if delta < 0:
+            missing_ref_duration = abs(delta) / source_tempo
+            replacement_start = transition_ref_time
+            replacement_end = transition_ref_time + missing_ref_duration
+            if (replacement_start > ref_time_i and replacement_end < search_hi
+                    and before_foreign_time >= 0):
+                transition_count += 1
+                replacement_id = f"AUDIO_REPLACEMENT_{transition_count:04d}"
+                # This gap is spliced in on both sides, so both boundaries must be safe cut points.
+                use_silence = not (aa.is_safe_splice_point(reference, sample_rate, replacement_start)
+                                    and aa.is_safe_splice_point(reference, sample_rate, replacement_end))
+                AUDIO_REPLACEMENT_RANGES.append({
+                    "id": replacement_id,
+                    "ref_start": replacement_start,
+                    "ref_end": replacement_end,
+                    "use_silence": use_silence,
+                })
+                refined_anchors.append((f"{replacement_id}_a_ref", f"{replacement_id}_a_foreign",
+                                         replacement_start, before_foreign_time))
+                refined_anchors.append((f"{replacement_id}_b_ref", f"{replacement_id}_b_foreign",
+                                         replacement_end, before_foreign_time))
+                fill_desc = "silence (unsafe mid-content splice point)" if use_silence else "reference audio"
+                logger.info(f"  Located missing foreign interval at ref {replacement_start:.3f}s-"
+                            f"{replacement_end:.3f}s (jump {delta:+.3f}s) -> "
+                            f"filling it with {fill_desc} instead of silence/stretching")
+            else:
+                logger.debug(f"    Skipping audio replacement near ref {transition_ref_time:.3f}s: "
+                             f"not enough room in [{ref_time_i:.3f}, {search_hi:.3f}]")
+            continue
+
+        epsilon = max(0.05, min(0.5, abs(delta) / 50.0))
+        before_ref_time = transition_ref_time - epsilon
+        after_ref_time = transition_ref_time + epsilon
+        if before_ref_time <= ref_time_i or after_ref_time >= search_hi:
+            logger.debug(f"    Skipping transition refinement near ref {transition_ref_time:.3f}s: not enough room in [{ref_time_i:.3f}, {search_hi:.3f}]")
+            continue
+
+        before_foreign_time = (before_ref_time + offset_i) * source_tempo
+        after_foreign_time = (after_ref_time + offset_j) * source_tempo
+        if after_foreign_time <= before_foreign_time or before_foreign_time < 0:
+            logger.debug(f"    Skipping transition refinement near ref {transition_ref_time:.3f}s: non-monotonic foreign times")
+            continue
+
+        transition_count += 1
+        refined_anchors.append((f"AUDIO_TRANSITION_{transition_count:04d}a_ref", f"AUDIO_TRANSITION_{transition_count:04d}a_foreign",
+                                 before_ref_time, before_foreign_time))
+        refined_anchors.append((f"AUDIO_TRANSITION_{transition_count:04d}b_ref", f"AUDIO_TRANSITION_{transition_count:04d}b_foreign",
+                                 after_ref_time, after_foreign_time))
+        logger.info(f"  Located precise transition at ref {transition_ref_time:.3f}s (jump {delta:+.3f}s) -> "
+                    f"hard-cut anchors at {before_ref_time:.3f}s/{after_ref_time:.3f}s instead of stretching the "
+                    f"surrounding {ref_time_j - ref_time_i:.1f}s window")
+
+    if transition_count > 0:
+        refined_anchors.sort(key=lambda a: a[2])
+        logger.info(f"  -> Refined {transition_count} abrupt offset jump(s) into near-instant hard cuts.")
+        final_anchors = refined_anchors
+    else:
+        final_anchors = anchors
+
+    if anchor_report_csv:
+        _write_anchor_report_csv(anchor_report_csv, candidate_measurements, anchors, final_anchors, min_confidence)
+
+    return final_anchors
+
+
+def _write_anchor_report_csv(path, candidate_measurements, accepted_anchors, final_anchors, min_confidence):
+    """Dump every scanned correlation window plus the final anchor list for manual review.
+
+    ``candidate_measurements`` covers every coarse window tried (accepted or not), so gaps
+    between accepted anchors (e.g. rejected windows in a stretch with low correlation
+    confidence) are directly visible instead of only inferred from log timestamps.
+    """
+    accepted_ref_times = {round(anchor[2], 3) for anchor in accepted_anchors}
+    try:
+        with open(path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["source", "ref_time", "foreign_time", "offset", "waveform_offset",
+                              "envelope_offset", "waveform_confidence", "envelope_confidence", "accepted"])
+            for (ref_time, offset, waveform_offset, envelope_offset,
+                 waveform_confidence, envelope_confidence) in candidate_measurements:
+                accepted = round(ref_time, 3) in accepted_ref_times
+                best_confidence = max(waveform_confidence, envelope_confidence)
+                writer.writerow([
+                    "window_scan", f"{ref_time:.3f}", "", f"{offset:+.3f}",
+                    f"{waveform_offset:+.3f}", f"{envelope_offset:+.3f}",
+                    f"{waveform_confidence:.2f}", f"{envelope_confidence:.2f}",
+                    "yes" if accepted else ("no (low confidence)" if best_confidence < min_confidence
+                                             else "no (disagreement)"),
+                ])
+            for ref_name, _, ref_time, foreign_time in final_anchors:
+                writer.writerow([
+                    ref_name.rsplit('_ref', 1)[0], f"{ref_time:.3f}", f"{foreign_time:.3f}",
+                    "", "", "", "", "", "final_anchor",
+                ])
+        logger.info(f"  -> Wrote anchor report CSV to {path}")
+    except Exception as e:
+        logger.warning(f"  Failed to write anchor report CSV: {e}")
+
 
 # --- Audio Syncing Stage Functions ---
 
@@ -1626,6 +2453,12 @@ def find_audio_start_end(wav_path, db_threshold):
 
         if amplitude.size == 0: return 0.0, 0.0 # Check again after potential flattening
 
+        # Boundary detection is level-independent; the exported audio is not
+        # modified. This handles quiet AC3 tracks without changing their sound.
+        analysis_peak = np.percentile(amplitude, 99.5)
+        if analysis_peak > 1e-12:
+            amplitude = amplitude * (0.9 / analysis_peak)
+
         # Convert dB threshold to linear amplitude threshold
         # threshold = 10^(dB/20)
         threshold_amplitude = 10.0**(db_threshold / 20.0)
@@ -1665,7 +2498,26 @@ def find_audio_start_end(wav_path, db_threshold):
         logger.error(f"ERROR processing WAV {os.path.basename(wav_path)}: {e}", exc_info=True)
         return None, None
 
-def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, ref_duration, segment_num, temp_dir, max_iterations=3, target_precision_ms=5, is_first_segment=False, is_last_segment=False, first_adjust_ms=0.0, last_adjust_ms=0.0):
+
+def measure_mean_volume_db(wav_path, start_time, end_time):
+    """Return the mean volume (dBFS) of a time window in a WAV file via ffmpeg's volumedetect, or None on failure."""
+    duration = end_time - start_time
+    if duration <= 0:
+        return None
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-ss", f"{max(0.0, start_time):.8f}", "-t", f"{duration:.8f}",
+        "-i", wav_path,
+        "-af", "volumedetect", "-f", "null", "-"
+    ]
+    success, stderr = run_ffmpeg(cmd, "Measure Level (volumedetect)", capture_stderr=True)
+    if not success or not stderr:
+        return None
+    match = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", stderr)
+    return float(match.group(1)) if match else None
+
+
+def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, ref_duration, segment_num, temp_dir, max_iterations=3, target_precision_ms=5, is_first_segment=False, is_last_segment=False, first_adjust_ms=0.0, last_adjust_ms=0.0, gain_db=0.0):
     """
     Processes an audio segment, iteratively adjusting 'atempo' to match a target duration precisely.
 
@@ -1775,12 +2627,14 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
             filter_parts.append(f"{concat_inputs}concat=n={n_inputs}:v=0:a=1[padded]")
             
             # Apply atempo to the padded audio
-            filter_parts.append(f"[padded]atempo={clamped_speed:.8f}")
+            gain_stage = f",volume={gain_db:.3f}dB" if gain_db else ""
+            filter_parts.append(f"[padded]atempo={clamped_speed:.8f}{gain_stage}")
             
             filter_complex = ";".join(filter_parts)
         else:
             # No padding needed - simple filter
-            filter_complex = f"atrim=start={adjusted_foreign_start:.8f}:end={adjusted_foreign_end:.8f},asetpts=PTS-STARTPTS,atempo={clamped_speed:.8f}"
+            gain_stage = f",volume={gain_db:.3f}dB" if gain_db else ""
+            filter_complex = f"atrim=start={adjusted_foreign_start:.8f}:end={adjusted_foreign_end:.8f},asetpts=PTS-STARTPTS,atempo={clamped_speed:.8f}{gain_stage}"
         
         process_cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
@@ -1849,7 +2703,7 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
             silence_path = os.path.join(temp_dir, f"silence_{segment_num:04d}.wav")
             silence_cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
-                "-f", "lavfi", "-i", f"anullsrc=r={DEFAULT_SAMPLE_RATE}:cl={DEFAULT_CHANNELS}",
+                "-f", "lavfi", "-i", f"anullsrc=r={DEFAULT_SAMPLE_RATE}:cl={'stereo' if DEFAULT_CHANNELS == 2 else 'mono'}",
                 "-t", f"{final_duration_gap:.8f}",
                 "-c:a", "pcm_s16le", "-y", silence_path
             ]
@@ -1906,6 +2760,46 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
 
     logger.error(f" Segment {segment_num}: Failed to produce final segment after iterations and correction.")
     return None
+
+
+def fallback_direct_segment(source_wav, source_start, source_end, out_path, segment_num, label="segment", gain_db=0.0):
+    """Directly extract a time-slice as a last-resort fallback when iterative processing fails."""
+    segment_duration = source_end - source_start
+    if segment_duration <= 0:
+        logger.warning(f"  -> {label} {segment_num}: invalid fallback range ({source_start:.3f}s -> {source_end:.3f}s)")
+        return False
+
+    fallback_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+        "-i", source_wav,
+        "-ss", f"{source_start:.8f}",
+        "-t", f"{segment_duration:.8f}",
+    ]
+    if gain_db:
+        fallback_cmd.extend(["-af", f"volume={gain_db:.3f}dB"])
+    fallback_cmd.extend([
+        "-c:a", "pcm_s16le",
+        "-ar", str(DEFAULT_SAMPLE_RATE),
+        "-ac", str(DEFAULT_CHANNELS),
+        "-y", out_path
+    ])
+
+    if not run_ffmpeg(fallback_cmd, f"Fallback {label.title()} {segment_num} Slice")[0]:
+        logger.error(f"  -> {label.title()} {segment_num}: fallback extraction failed. The iterative segment processing was unsuccessful and the direct slice recovery also failed.")
+        return False
+
+    duration = get_file_duration(out_path, media_type='audio')
+    if duration is None:
+        logger.warning(f"  -> {label.title()} {segment_num}: direct slice fallback created a file, but its duration could not be verified; continuing with caution.")
+        return False
+
+    if duration <= 0:
+        logger.warning(f"  -> {label.title()} {segment_num}: direct slice fallback produced a non-positive duration ({duration:.3f}s); this segment will not be used.")
+        return False
+
+    logger.warning(f"  -> {label.title()} {segment_num}: FALLBACK ACTIVE - direct slice recovery was used because iterative segment processing failed.")
+    return True
+
 def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_path, temp_dir, db_threshold, min_segment_duration):
     """
     Audio sync stage using iterative refinement for precise segment durations.
@@ -1917,6 +2811,8 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     # Define full paths for extracted audio
     ref_wav_full = os.path.join(temp_dir, "ref_audio_full.wav")
     foreign_wav_full = os.path.join(temp_dir, "foreign_audio_full.wav")
+    ref_wav_analysis = os.path.join(temp_dir, "ref_audio_analysis.wav")
+    foreign_wav_analysis = os.path.join(temp_dir, "foreign_audio_analysis.wav")
 
     # --- Step 1: Determine Audio Stream Indices ---
     logger.info(f"--- Finding Audio Streams (Ref: {args.ref_lang}, Foreign: {args.foreign_lang}) ---")
@@ -1944,16 +2840,16 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
 
     # --- Step 2: Extract Full Audio Tracks ---
     logger.info(f"--- Extracting Audio Tracks (Ref Index: {ref_stream_idx}, Foreign Index: {foreign_stream_idx}) ---")
-    # Consistent resampling for quality and compatibility
-    aresample_filter = f'aresample=resampler=soxr:precision=28:cutoff={0.99 if DEFAULT_SAMPLE_RATE >= 44100 else 0.90}'
-
+    # Pristine extraction: only a lossless container/PCM conversion, no loudness or level changes.
+    # This is what final segments are actually cut from, so the output preserves the source's
+    # original dynamics/volume instead of permanently baking in analysis-only normalization.
     extract_cmd_ref = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats",
                        "-i", args.ref_video,
                        # Use absolute stream index mapping:
                        "-map", f"0:{ref_stream_idx}", # <<< CORRECTED MAPPING
                        "-vn",
                        "-c:a", "pcm_s16le", "-ar", str(DEFAULT_SAMPLE_RATE), "-ac", str(DEFAULT_CHANNELS),
-                       "-af", aresample_filter, "-y", "-f", "wav", ref_wav_full]
+                       "-y", "-f", "wav", ref_wav_full]
     if not run_ffmpeg(extract_cmd_ref, f"Extract Reference Audio (Index {ref_stream_idx})")[0]:
         return None, None # Abort if extraction fails
 
@@ -1964,14 +2860,39 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
                            "-map", f"0:{foreign_stream_idx}", # <<< CORRECTED MAPPING
                            "-vn",
                            "-c:a", "pcm_s16le", "-ar", str(DEFAULT_SAMPLE_RATE), "-ac", str(DEFAULT_CHANNELS),
-                           "-af", aresample_filter, "-y", "-f", "wav", foreign_wav_full]
+                           "-y", "-f", "wav", foreign_wav_full]
     if not run_ffmpeg(extract_cmd_foreign, f"Extract Foreign Audio (Index {foreign_stream_idx})")[0]:
         return None, None # Abort if extraction fails
 
+    # Analysis-only copies: resampled + loudness-normalized so boundary/silence detection is
+    # reliable even on quiet source streams (e.g. low-level AC3 tracks). Never used as output content.
+    aresample_filter = f'aresample=resampler=soxr:precision=28:cutoff={0.99 if DEFAULT_SAMPLE_RATE >= 44100 else 0.90}'
+    loudness_filter = 'loudnorm=I=-23:TP=-1.5:LRA=11'
+    audio_filter_chain = f'{aresample_filter},{loudness_filter}'
+
+    extract_cmd_ref_analysis = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+                       "-i", args.ref_video,
+                       "-map", f"0:{ref_stream_idx}",
+                       "-vn",
+                       "-c:a", "pcm_s16le", "-ar", str(DEFAULT_SAMPLE_RATE), "-ac", str(DEFAULT_CHANNELS),
+                       "-af", audio_filter_chain, "-y", "-f", "wav", ref_wav_analysis]
+    if not run_ffmpeg(extract_cmd_ref_analysis, "Extract Reference Audio (Analysis Copy)")[0]:
+        return None, None
+
+    extract_cmd_foreign_analysis = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+                           "-i", args.foreign_video,
+                           "-map", f"0:{foreign_stream_idx}",
+                           "-vn",
+                           "-c:a", "pcm_s16le", "-ar", str(DEFAULT_SAMPLE_RATE), "-ac", str(DEFAULT_CHANNELS),
+                           "-af", audio_filter_chain, "-y", "-f", "wav", foreign_wav_analysis]
+    if not run_ffmpeg(extract_cmd_foreign_analysis, "Extract Foreign Audio (Analysis Copy)")[0]:
+        return None, None
+
     # --- Step 3: Detect Audio Boundaries ---
     logger.info(f"--- Detecting Audio Content Boundaries (Threshold: {db_threshold} dB) ---")
-    ref_start_s, ref_end_s = find_audio_start_end(ref_wav_full, db_threshold)
-    foreign_start_s, foreign_end_s = find_audio_start_end(foreign_wav_full, db_threshold)
+    ref_start_s, ref_end_s = find_audio_start_end(ref_wav_analysis, db_threshold)
+    foreign_start_s, foreign_end_s = find_audio_start_end(foreign_wav_analysis, db_threshold)
+
 
     if ref_start_s is None or foreign_start_s is None:
         logger.error("-> Failed to detect audio boundaries. Cannot proceed.")
@@ -1999,7 +2920,12 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     # Add visual anchors from Stage 1, ensuring they fall within the detected audio content times
     # EXCEPTION: Forced sync points (starting with 'FORCED_SYNC_') bypass boundary checks
     for ref_name, _, ref_img_time, foreign_img_time in visual_anchors_details:
-        is_forced = ref_name.startswith('FORCED_SYNC_')
+        # AUDIO_TRANSITION_ anchors bracket a precisely-located hard-cut (see _locate_transition_point)
+        # and must bypass filtering just like FORCED_SYNC_ points, or the tiny segment they define
+        # gets stripped out and the jump gets smeared back across the surrounding window.
+        is_forced = (ref_name.startswith('FORCED_SYNC_')
+                 or ref_name.startswith('AUDIO_TRANSITION_')
+                 or ref_name.startswith('AUDIO_REPLACEMENT_'))
         
         if is_forced:
             # Forced sync points are always included (that's the point!)
@@ -2191,13 +3117,73 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         ref_end, foreign_end = final_segment_anchors[i+1]
         target_ref_duration = ref_end - ref_start # This is the target duration for the output segment
 
+        replacement_range = next(
+            (item for item in AUDIO_REPLACEMENT_RANGES
+             if abs(item["ref_start"] - ref_start) < 0.001
+             and abs(item["ref_end"] - ref_end) < 0.001),
+            None,
+        )
+        segment_source_wav = foreign_wav_full
+        segment_source_start = foreign_start
+        segment_source_end = foreign_end
+        if replacement_range is not None and replacement_range.get("use_silence"):
+            # Copying reference audio here would hard-cut mid-note/mid-phrase content,
+            # which sounds worse than a silent gap of the same duration.
+            logger.info(f"  -> Segment {segment_num}: Filling missing foreign content "
+                        f"({ref_start:.3f}s-{ref_end:.3f}s) with silence "
+                        f"(reference audio here is not a natural cut point)")
+            silence_path = os.path.join(temp_dir, f"segment_{segment_num:04d}_silence.wav")
+            silence_cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+                "-f", "lavfi", "-i", f"anullsrc=r={DEFAULT_SAMPLE_RATE}:cl={'stereo' if DEFAULT_CHANNELS == 2 else 'mono'}",
+                "-t", f"{target_ref_duration:.8f}",
+                "-c:a", "pcm_s16le", "-y", silence_path
+            ]
+            if run_ffmpeg(silence_cmd, f"Create Silence Fill for Segment {segment_num} ({target_ref_duration:.3f}s)")[0]:
+                processed_segment_files.append(silence_path)
+                total_processed_ref_duration += target_ref_duration
+                pbar.update(1)
+                continue
+            else:
+                logger.error(f" Segment {segment_num}: Failed to create silence fill; falling back to copying reference audio.")
+        if replacement_range is not None:
+            segment_source_wav = ref_wav_full
+            segment_source_start = ref_start
+            segment_source_end = ref_end
+            logger.info(f"  -> Segment {segment_num}: Filling missing foreign content "
+                        f"({ref_start:.3f}s-{ref_end:.3f}s) with reference audio")
+
         logger.debug(f"Processing Segment {segment_num}/{num_segments}")
+
+        # Level-match inserted reference audio to its surrounding foreign content, so the
+        # splice doesn't suddenly sound much louder/quieter than the rest of the track.
+        gain_db = 0.0
+        if replacement_range is not None:
+            context_window = 1.5
+            context_levels = []
+            if i > 0:
+                level_before = measure_mean_volume_db(foreign_wav_full, max(0.0, foreign_start - context_window), foreign_start)
+                if level_before is not None and level_before > -60.0:
+                    context_levels.append(level_before)
+            if i < num_segments - 1:
+                level_after = measure_mean_volume_db(foreign_wav_full, foreign_end, foreign_end + context_window)
+                if level_after is not None and level_after > -60.0:
+                    context_levels.append(level_after)
+            ref_level = measure_mean_volume_db(ref_wav_full, ref_start, ref_end)
+            if context_levels and ref_level is not None and ref_level > -60.0:
+                target_level = sum(context_levels) / len(context_levels)
+                gain_db = max(-15.0, min(15.0, target_level - ref_level))
+                if abs(gain_db) > 0.5:
+                    logger.info(f"  -> Segment {segment_num}: Matching inserted audio level to surrounding "
+                                f"foreign content ({ref_level:+.1f}dB -> {target_level:+.1f}dB, gain {gain_db:+.1f}dB)")
+                else:
+                    gain_db = 0.0
 
         # Call the iterative processing function for this segment
         segment_path = process_segment_iteratively(
-            foreign_wav_full=foreign_wav_full,
-            foreign_start=foreign_start,
-            foreign_end=foreign_end,
+            foreign_wav_full=segment_source_wav,
+            foreign_start=segment_source_start,
+            foreign_end=segment_source_end,
             ref_duration=target_ref_duration, # Pass the target duration
             segment_num=segment_num,
             temp_dir=temp_dir,
@@ -2206,16 +3192,31 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             is_first_segment=(segment_num == 1),
             is_last_segment=(segment_num == num_segments),
             first_adjust_ms=args.first_segment_adjust,
-            last_adjust_ms=args.last_segment_adjust
+            last_adjust_ms=args.last_segment_adjust,
+            gain_db=gain_db
         )
 
         if segment_path and os.path.exists(segment_path):
             processed_segment_files.append(segment_path)
             total_processed_ref_duration += target_ref_duration # Add target duration to total
         else:
-            pbar.close()
-            logger.error(f"Failed to process segment {segment_num}. Aborting audio synchronization.")
-            return None, None # Critical failure, stop processing
+            fallback_path = os.path.join(temp_dir, f"segment_{segment_num:04d}_fallback.wav")
+            logger.warning(f"Segment {segment_num}: iterative processing failed. Activating direct segment fallback recovery.")
+            if fallback_direct_segment(
+                source_wav=segment_source_wav,
+                source_start=segment_source_start,
+                source_end=segment_source_end,
+                out_path=fallback_path,
+                segment_num=segment_num,
+                label="segment",
+                gain_db=gain_db
+            ):
+                processed_segment_files.append(fallback_path)
+                total_processed_ref_duration += target_ref_duration
+            else:
+                pbar.close()
+                logger.error(f"Failed to recover segment {segment_num}. Both iterative processing and direct fallback failed; aborting audio synchronization.")
+                return None, None # Critical failure, stop processing
         
         pbar.update(1)
 
@@ -2500,6 +3501,52 @@ def run_muxing(args, ref_stream_idx, synced_subtitles=None, synced_foreign_track
     return True
 
 
+# Maps a source audio codec_name to the ffmpeg encoder used to re-encode it "in kind".
+AUDIO_CODEC_ENCODER_MAP = {
+    'aac': 'aac', 'mp3': 'libmp3lame', 'ac3': 'ac3', 'eac3': 'eac3',
+    'opus': 'libopus', 'vorbis': 'libvorbis', 'flac': 'flac', 'alac': 'alac',
+    'pcm_s16le': 'pcm_s16le', 'pcm_s24le': 'pcm_s24le', 'pcm_s32le': 'pcm_s32le',
+}
+LOSSLESS_AUDIO_ENCODERS = {'flac', 'alac', 'pcm_s16le', 'pcm_s24le', 'pcm_s32le'}
+
+
+def resolve_output_audio_settings(source_stream_info, requested_codec, requested_bitrate):
+    """Resolve 'auto' codec/bitrate to match the foreign source, so the output neither
+    gains nor loses quality/format by default unless the user explicitly overrides it."""
+    source_codec = (source_stream_info or {}).get('codec_name', '').lower()
+    source_bitrate = (source_stream_info or {}).get('bit_rate')
+
+    codec = requested_codec
+    if codec == 'auto':
+        codec = AUDIO_CODEC_ENCODER_MAP.get(source_codec)
+        if not codec:
+            logger.warning(f"  No suitable encoder mapping for source codec '{source_codec}'; "
+                           f"falling back to lossless FLAC to avoid any quality loss.")
+            codec = 'flac'
+        else:
+            logger.info(f"  Auto-selected output codec '{codec}' to match source codec '{source_codec}'.")
+
+    bitrate = requested_bitrate
+    if bitrate == 'auto':
+        if codec in LOSSLESS_AUDIO_ENCODERS:
+            bitrate = None  # Not applicable for lossless encoders
+        elif source_bitrate and str(source_bitrate).isdigit():
+            bitrate = f"{max(1, round(int(source_bitrate) / 1000))}k"
+            logger.info(f"  Auto-selected output bitrate '{bitrate}' to match source bitrate.")
+        else:
+            bitrate = DEFAULT_MUX_ABITRATE_FALLBACK
+            logger.warning(f"  Could not detect source bitrate; using fallback {bitrate}.")
+    return codec, bitrate
+
+
+def get_foreign_audio_stream_info(video_path, stream_idx):
+    """Looks up the ffprobe stream dict for a specific absolute audio stream index."""
+    streams = get_stream_info(video_path)
+    if not streams:
+        return None
+    return next((s for s in streams if s.get('index') == stream_idx), None)
+
+
 def _mux_with_mkvmerge(args, synced_foreign_tracks, synced_subtitles=None):
     """
     Mux using mkvmerge - preserves ALL original content from reference video
@@ -2513,19 +3560,26 @@ def _mux_with_mkvmerge(args, synced_foreign_tracks, synced_subtitles=None):
 
     for track in synced_foreign_tracks:
         foreign_audio_input = track['wav_path']
-        
-        if args.mux_foreign_codec != 'copy' and args.mux_foreign_codec != 'pcm_s16le':
+
+        source_stream_info = get_foreign_audio_stream_info(args.foreign_video, track['stream_idx'])
+        codec, bitrate = resolve_output_audio_settings(
+            source_stream_info, args.mux_foreign_codec, args.mux_foreign_bitrate)
+
+        if codec != 'copy' and codec != 'pcm_s16le':
             ext_map = {'aac': '.m4a', 'ac3': '.ac3', 'flac': '.flac', 'opus': '.opus'}
-            ext = ext_map.get(args.mux_foreign_codec, '.mka')
+            ext = ext_map.get(codec, '.mka')
             temp_encoded = track['wav_path'] + ext
-            
+
             encode_cmd = [
                 'ffmpeg', '-hide_banner', '-loglevel', 'warning',
                 '-i', track['wav_path'],
-                '-c:a', args.mux_foreign_codec,
-                '-b:a', args.mux_foreign_bitrate,
-                '-y', temp_encoded
             ]
+            if args.audio_filters:
+                encode_cmd.extend(['-af', args.audio_filters])
+            encode_cmd.extend(['-c:a', codec])
+            if bitrate:
+                encode_cmd.extend(['-b:a', bitrate])
+            encode_cmd.extend(['-y', temp_encoded])
             encode_success, _ = run_ffmpeg(encode_cmd, f"Pre-encode track #{track['stream_idx']}")
             if not encode_success:
                 logger.error(f"Failed to pre-encode track #{track['stream_idx']}")
@@ -2636,12 +3690,17 @@ def _mux_with_ffmpeg(args, ref_stream_idx, synced_foreign_tracks, synced_subtitl
     # Codec settings - copy everything from reference
     ffmpeg_cmd.extend(['-c', 'copy'])
 
-    # Encode each new foreign audio track
+    # Encode each new foreign audio track, resolving 'auto' codec/bitrate to match its source
     for i, track in enumerate(synced_foreign_tracks):
         audio_idx = num_ref_audio + i
-        ffmpeg_cmd.extend([f'-c:a:{audio_idx}', args.mux_foreign_codec])
-        if args.mux_foreign_codec != 'copy':
-            ffmpeg_cmd.extend([f'-b:a:{audio_idx}', args.mux_foreign_bitrate])
+        source_stream_info = get_foreign_audio_stream_info(args.foreign_video, track['stream_idx'])
+        codec, bitrate = resolve_output_audio_settings(
+            source_stream_info, args.mux_foreign_codec, args.mux_foreign_bitrate)
+        ffmpeg_cmd.extend([f'-c:a:{audio_idx}', codec])
+        if bitrate:
+            ffmpeg_cmd.extend([f'-b:a:{audio_idx}', bitrate])
+        if args.audio_filters:
+            ffmpeg_cmd.extend([f'-filter:a:{audio_idx}', args.audio_filters])
 
     # Subtitle codec for new subtitles
     if synced_subtitles:
@@ -2906,7 +3965,8 @@ def write_ass_file(ass_path, ass_data, adjusted_dialogues):
 
 # ---- Shared timing adjustment (works for both SRT and ASS dialogue entries) ----
 
-def adjust_subtitle_timing(subtitles, segment_anchors, ref_delay):
+def adjust_subtitle_timing(subtitles, segment_anchors, ref_delay,
+                           editorial_edits=None, source_tempo=1.0):
     """Adjust subtitle timing based on audio segments.
     
     Each subtitle entry must have 'start' and 'end' keys (in seconds).
@@ -2919,6 +3979,7 @@ def adjust_subtitle_timing(subtitles, segment_anchors, ref_delay):
     adjusted_subtitles = []
     dropped_subtitles = []
     num_segments = len(segment_anchors) - 1
+    aa = _import_audio_alignment() if editorial_edits else None
     
     logger.debug(f"\nSubtitle timing adjustment:")
     logger.debug(f"  Total subtitles: {len(subtitles)}")
@@ -2936,6 +3997,26 @@ def adjust_subtitle_timing(subtitles, segment_anchors, ref_delay):
         logger.debug(f"    Seg {i+1}: foreign=[{foreign_s:.2f}-{foreign_e:.2f}s], ref=[{ref_s:.2f}-{ref_e:.2f}s]")
     
     for idx, sub in enumerate(subtitles):
+        if editorial_edits:
+            new_start = aa.map_source_time_to_reference(
+                sub['start'], editorial_edits, source_tempo)
+            new_end = aa.map_source_time_to_reference(
+                sub['end'], editorial_edits, source_tempo)
+            if new_end <= new_start:
+                dropped_subtitles.append({
+                    'index': idx + 1,
+                    'start': sub['start'],
+                    'end': sub['end'],
+                    'text_preview': sub.get('text', sub.get('rest', ''))[:60],
+                    'reason': 'falls entirely inside a deleted source interval',
+                })
+                continue
+            adjusted = dict(sub)
+            adjusted['start'] = max(0, new_start)
+            adjusted['end'] = max(0, new_end)
+            adjusted_subtitles.append(adjusted)
+            continue
+
         segment_idx = None
         for i in range(num_segments):
             foreign_start = segment_anchors[i][1]
@@ -3056,7 +4137,8 @@ def extract_subtitle_stream(video_path, stream_idx, output_path, native_codec=Fa
 
 # ---- Main subtitle sync orchestrator ----
 
-def sync_subtitles(foreign_video, segment_anchors, ref_delay, temp_dir, foreign_lang):
+def sync_subtitles(foreign_video, segment_anchors, ref_delay, temp_dir, foreign_lang,
+                   editorial_edits=None, source_tempo=1.0):
     """Synchronize subtitle streams from foreign video.
     
     Preserves ASS/SSA format natively (fonts, styles, positioning).
@@ -3155,7 +4237,13 @@ def sync_subtitles(foreign_video, segment_anchors, ref_delay, temp_dir, foreign_
         logger.info(f"  Parsed {len(subtitle_entries)} subtitle entries")
         
         # Adjust timing (same logic for both formats)
-        adjusted_entries, dropped_entries = adjust_subtitle_timing(subtitle_entries, segment_anchors, ref_delay)
+        adjusted_entries, dropped_entries = adjust_subtitle_timing(
+            subtitle_entries,
+            segment_anchors,
+            ref_delay,
+            editorial_edits=editorial_edits,
+            source_tempo=source_tempo,
+        )
         logger.info(f"  Adjusted {len(adjusted_entries)} subtitle entries")
         
         # Log dropped subtitles
@@ -3198,9 +4286,9 @@ def sync_subtitles(foreign_video, segment_anchors, ref_delay, temp_dir, foreign_
 
 
 def main():
-    global FFMPEG_EXEC, FFPROBE_EXEC, MKVMERGE_EXEC
+    global FFMPEG_EXEC, FFPROBE_EXEC, MKVMERGE_EXEC, AUDIO_EDITORIAL_SOURCE_TEMPO
     parser = argparse.ArgumentParser(
-        description="AVSync: Synchronizes foreign audio to a reference video using visual anchors and precise audio timing.",
+        description="AVSync: Aligns foreign audio and subtitles to a reference timeline using audio-to-audio anchors and precise timing.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=f"""
 Example Usage:
@@ -3208,7 +4296,7 @@ Example Usage:
   python gs.py ref_video.mkv foreign_video.mkv output_video.mkv --ref_lang eng --foreign_lang spa
 
   # Specify audio streams by index instead of language (Use absolute stream indices shown)
-  python gs.py ref_video.mkv foreign_video.mkv output_video.mkv --ref_stream_idx 1 --foreign_stream_idx 2
+    python gs.py ref_video.mkv foreign_video.mkv output_video.mkv --ref_stream_idx 1 --foreign_stream_idx 2
 
   # Set minimum segment duration for audio filtering to 10 seconds (default is 5)
   python gs.py ref_video.mkv foreign_video.mkv output_video.mkv --min_segment_duration 10
@@ -3220,15 +4308,14 @@ Example Usage:
   python gs.py ref_video.mkv foreign_video.mkv output_video.mkv --qc_output_dir ./qc_images --output_csv segments.csv
 
 Workflow:
-1. Extracts scene change frames from both videos.
-2. Matches frames using anchor-and-follow: initial anchor search (+/- {MATCH_WINDOW_PERCENT*100}% of ref duration), then +{ANCHOR_FOLLOW_FORWARD_WINDOW_S}s forward from estimated position.
-3. Filters matches based on similarity and temporal consistency.
-4. Extracts audio tracks based on language tags or specified absolute indices.
-5. Determines audio content boundaries and filters anchor points based on minimum segment duration and duration difference.
-6. Processes audio segments iteratively to match reference timing precisely.
-7. Concatenates processed segments and applies start delay.
-8. (Optional) Generates QC images and/or segment info CSV.
-9. Muxes the reference video, original audio, and synchronized foreign audio into the final output video.
+1. Generates timeline anchors from matching original audio, or optionally from scene-change frames.
+2. For audio anchors, correlates waveform and energy envelopes and locates abrupt editorial transitions.
+3. Extracts audio tracks based on language tags or specified absolute indices.
+4. Determines audio content boundaries and filters anchor points based on minimum segment duration and duration difference.
+5. Processes audio segments iteratively to match reference timing precisely.
+6. Concatenates processed segments and applies start delay.
+7. (Optional) Retimes text subtitles and generates QC images or a segment CSV.
+8. Muxes the reference video, original audio, and synchronized foreign tracks into the final output video.
 """
     )
     # --- Input/Output Arguments ---
@@ -3254,6 +4341,34 @@ Workflow:
              "These bypass scene detection and are guaranteed sync points.")
     # Note: Match search window is now calculated automatically, not a direct argument
 
+    # --- Anchor Source Selection ---
+    anchor_group = parser.add_argument_group('Anchor Source Parameters')
+    anchor_group.add_argument("--anchor_source", choices=["visual", "audio"], default="visual",
+        help="How to generate sync anchor points. 'visual' (default) uses scene-change frame "
+             "matching. 'audio' uses audio cross-correlation instead - use this when the video "
+             "pair has such a large resolution/compression/aspect-ratio mismatch that template "
+             "matching gives few or inconsistent anchors. Requires the ref/foreign audio streams "
+             "to contain matching content (e.g. same-language dialogue).")
+    anchor_group.add_argument("--audio_anchor_window", type=float, default=60.0,
+        help="Audio anchor analysis window size in seconds (Default: 60.0)")
+    anchor_group.add_argument("--audio_anchor_step", type=float, default=30.0,
+        help="Step between consecutive audio anchor windows in seconds (Default: 30.0)")
+    anchor_group.add_argument("--audio_anchor_min_confidence", type=float, default=2.0,
+        help="Minimum peak/secondary-peak confidence ratio required to accept an audio anchor (Default: 2.0)")
+    anchor_group.add_argument("--audio_anchor_search_radius", type=float, default=20.0,
+        help="Seconds around the expected position to search in the foreign audio for each window (Default: 20.0)")
+    anchor_group.add_argument("--source_tempo", type=float, default=None,
+        help="Manual atempo factor applied to foreign audio before correlation (e.g. 0.959 for 25fps->23.976fps). "
+             "If omitted, it is auto-detected from each video's frame rate.")
+    anchor_group.add_argument("--audio_jump_tolerance", type=float, default=0.15,
+        help="Offset change (seconds) between consecutive audio anchors above which it's treated as a "
+             "discrete editorial cut rather than gradual drift, triggering precise transition-point "
+             "detection instead of stretching the whole window (Default: 0.15)")
+    anchor_group.add_argument("--anchor_report_csv", default=None, metavar="PATH",
+        help="Write a CSV dump of every audio-anchor correlation window scanned (accepted or not, "
+             "with confidence/offset) plus the final anchor list actually used, for manual inspection "
+             "of anchor density and confidence in a specific episode. Only applies to --anchor_source audio.")
+
     # --- Audio Processing Arguments ---
     audio_group = parser.add_argument_group('Audio Processing Parameters')
     audio_group.add_argument("--ref_lang", default=DEFAULT_REF_LANG, help=f"Reference audio language code (3-letter ISO 639-2/T) for stream selection. (Default: {DEFAULT_REF_LANG})")
@@ -3264,6 +4379,9 @@ Workflow:
     audio_group.add_argument("--last_segment_adjust", type=float, default=0.0, help="Adjustment in milliseconds for the LAST segment. Positive = add padding at end, Negative = trim from end. Applied BEFORE atempo processing (Default: 0.0ms).")
     audio_group.add_argument("--ref_stream_idx", type=int, default=None, help="Force specific *absolute* audio stream index for reference video (e.g., 1, 2, ...). Overrides --ref_lang.")
     audio_group.add_argument("--foreign_stream_idx", type=int, default=None, help="Force specific *absolute* audio stream index for foreign video. Overrides --foreign_lang.")
+    audio_group.add_argument("--foreign_anchor_stream_idx", type=int, default=None,
+        help="Absolute audio stream index in the foreign video containing the original audio used for audio-to-audio comparison. "
+             "If omitted, --foreign_stream_idx is used for backward compatibility.")
     audio_group.add_argument("--foreign_tracks", type=str, default=None, metavar="TRACKS",
         help="Which foreign audio tracks to sync and include in output. "
              "Options: 'primary' (just the main track, default behavior), "
@@ -3274,8 +4392,17 @@ Workflow:
 
     # --- Muxing Arguments ---
     mux_group = parser.add_argument_group('Muxing Parameters')
-    mux_group.add_argument("--mux_foreign_codec", default=DEFAULT_MUX_ACODEC, help=f"Audio codec for the synced foreign track in the muxed output (e.g., 'aac', 'ac3', 'copy'). (Default: {DEFAULT_MUX_ACODEC})")
-    mux_group.add_argument("--mux_foreign_bitrate", default=DEFAULT_MUX_ABITRATE, help=f"Audio bitrate for the synced foreign track if re-encoding (e.g., '192k', '320k'). (Default: {DEFAULT_MUX_ABITRATE})")
+    mux_group.add_argument("--mux_foreign_codec", default=DEFAULT_MUX_ACODEC,
+        help="Audio codec for the synced foreign track in the muxed output (e.g., 'aac', 'ac3', 'flac', 'copy'). "
+             "'auto' matches the foreign source's own codec so quality/format is neither gained nor lost "
+             f"(falls back to lossless FLAC if the source codec has no suitable encoder). (Default: {DEFAULT_MUX_ACODEC})")
+    mux_group.add_argument("--mux_foreign_bitrate", default=DEFAULT_MUX_ABITRATE,
+        help="Audio bitrate for the synced foreign track if re-encoding (e.g., '192k', '320k'). "
+             f"'auto' matches the foreign source's own bitrate (ignored for lossless codecs). (Default: {DEFAULT_MUX_ABITRATE})")
+    mux_group.add_argument("--audio_filters", default=None,
+        help="Optional ffmpeg -af filter chain applied to the synced foreign track before final encoding "
+             "(e.g., 'loudnorm=I=-16:TP=-1.5:LRA=11' or 'highpass=f=80,adeclick'). Opt-in only: by default "
+             "no enhancement filters are applied, to avoid altering the source's original character.")
 
 
     # --- Caching Arguments ---
@@ -3503,7 +4630,7 @@ Workflow:
         temp_dir = temp_dir_obj.name # Get the path string
         logger.info(f"\nUsing temporary directory: {temp_dir}")
 
-        # === Stage 1: Image Pairing ===
+        # === Stage 1: Anchor Pairing (Visual or Audio) ===
         # Try to load from cache if enabled
         visual_anchors_details = None
         if args.use_cache:
@@ -3512,21 +4639,49 @@ Workflow:
             if checkpoint:
                 visual_anchors_details = checkpoint.get('visual_anchors_details')
                 if visual_anchors_details:
-                    logger.info("[CACHE] Using cached visual anchors, skipping frame extraction and matching")
-        
-        # Run image pairing if not loaded from cache
+                    AUDIO_REPLACEMENT_RANGES[:] = checkpoint.get('audio_replacement_ranges') or []
+                    AUDIO_EDITORIAL_EDITS[:] = checkpoint.get('audio_editorial_edits') or []
+                    AUDIO_EDITORIAL_SOURCE_TEMPO = checkpoint.get('audio_editorial_source_tempo', 1.0)
+                    logger.info("[CACHE] Using cached anchors, skipping frame/audio anchor detection")
+
+        # Run anchor detection if not loaded from cache
         if visual_anchors_details is None:
-            visual_anchors_details = run_image_pairing_stage(
-                ref_video_path=args.ref_video,
-                foreign_video_path=args.foreign_video,
-                temp_dir=temp_dir,
-                scene_threshold=args.scene_threshold,
-                match_threshold=args.match_threshold,
-                similarity_threshold=args.similarity_threshold
-            )
-            if visual_anchors_details is None:
-                raise RuntimeError("Image Pairing Stage Failed: No visual anchors generated.")
-            
+            if args.anchor_source == "audio":
+                anchor_ref_stream_idx, anchor_foreign_stream_idx = resolve_anchor_stream_indices(args)
+                if anchor_ref_stream_idx is None or anchor_foreign_stream_idx is None:
+                    raise RuntimeError("Audio Anchor Pairing Stage Failed: Could not resolve ref/foreign audio stream indices.")
+                source_tempo = args.source_tempo
+                if source_tempo is None:
+                    source_tempo = compute_auto_source_tempo(args.ref_video, args.foreign_video)
+                else:
+                    logger.info(f"  Global FPS normalization: using manual factor={source_tempo:.9f}")
+                visual_anchors_details = run_audio_pairing_stage(
+                    ref_video_path=args.ref_video,
+                    foreign_video_path=args.foreign_video,
+                    ref_stream_idx=anchor_ref_stream_idx,
+                    foreign_stream_idx=anchor_foreign_stream_idx,
+                    source_tempo=source_tempo,
+                    window_seconds=args.audio_anchor_window,
+                    step_seconds=args.audio_anchor_step,
+                    min_confidence=args.audio_anchor_min_confidence,
+                    search_radius_seconds=args.audio_anchor_search_radius,
+                    jump_tolerance_seconds=args.audio_jump_tolerance,
+                    anchor_report_csv=args.anchor_report_csv,
+                )
+                if visual_anchors_details is None:
+                    raise RuntimeError("Audio Anchor Pairing Stage Failed: No audio anchors generated.")
+            else:
+                visual_anchors_details = run_image_pairing_stage(
+                    ref_video_path=args.ref_video,
+                    foreign_video_path=args.foreign_video,
+                    temp_dir=temp_dir,
+                    scene_threshold=args.scene_threshold,
+                    match_threshold=args.match_threshold,
+                    similarity_threshold=args.similarity_threshold
+                )
+                if visual_anchors_details is None:
+                    raise RuntimeError("Image Pairing Stage Failed: No visual anchors generated.")
+
             # Save checkpoint if caching is enabled
             if args.use_cache:
                 cache_path = get_cache_path(args)
@@ -3601,7 +4756,9 @@ Workflow:
                 segment_anchors=final_segment_anchors,
                 ref_delay=final_ref_delay,
                 temp_dir=temp_dir,
-                foreign_lang=args.foreign_lang
+                foreign_lang=args.foreign_lang,
+                editorial_edits=AUDIO_EDITORIAL_EDITS,
+                source_tempo=AUDIO_EDITORIAL_SOURCE_TEMPO,
             )
 
         # === Stage 2.7: Sync Additional Foreign Audio Tracks ===

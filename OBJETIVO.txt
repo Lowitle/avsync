@@ -1,0 +1,43 @@
+***SINCRONIZADOR AUDIO-VIDEO-SUBTÍTULOS MEDIANTE PROCESO DE SINCRONIZACIÓN AUDIO-AUDIO***
+
+Sincronización para casos en los que:
+
+- Tenemos un archivo en el que tenemos:
+
+Archivo 1:
+-- Pista vídeo.
+-- Pista audio original.
+-- Pista audio extranjero 1.
+-- Pista audio extranjero 2.
+-- Pista audio extranjero 3...
+-- Pista subtítulo 1
+-- Pista subtítulo 2
+-- Pista subtítulo 3
+
+(Lógicamente basta con que tengamos el Audio Original y uno extranjero)
+
+El vídeo de este archivo es de baja calidad y queremos sustituirlo por el vídeo de otra fuente de mayor calidad, este otro vídeo también tiene el audio original.
+
+Archivo 2:
+-- Pista de video HQ.
+-- Pista de audio original.
+
+La estrategia que estamos utilizando es:
+1. Detectar las diferencias entre:
+*Pista audio original_Archivo 1
+*Pista audio original_Archivo 2
+
+2. Con las diferencias detectadas, aplicamos estas correcciones en todas las demás pistas de audio y subtítulos que tenga el Archivo 1. Y hacemos un archivo nuevo, final:
+
+
+Archivo Final:
+-- Pista vídeo_Archivo 2
+-- Pista audio original_Archivo 2
+-- Pista audio extranjero 1_Archivo 1_con correcciones.
+-- Pista audio extranjero 2_Archivo 1_con correcciones.
+-- Pista audio extranjero 3_Archivo 1_con correcciones.
+-- Pista subtítulo 1_Archivo 1_con correcciones.
+-- Pista subtítulo 2_Archivo 1_con correcciones.
+-- Pista subtítulo 3_Archivo 1_con correcciones.
+
+(Lógicamente solo las pistas que realmente tengamos)
