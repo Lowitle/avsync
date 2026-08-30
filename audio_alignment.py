@@ -7,6 +7,7 @@ AVSync command-line workflow.
 """
 
 import subprocess
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -215,7 +216,17 @@ def estimate_noise_floor_db(samples, sample_rate, frame_seconds=0.02, percentile
     frames = samples[:frame_count * frame_size].reshape(frame_count, frame_size)
     rms = np.sqrt(np.mean(np.square(frames), axis=1))
     floor_rms = np.percentile(rms, percentile)
-    return 20.0 * np.log10(floor_rms + 1e-9)
+    noise_floor_db = 20.0 * np.log10(floor_rms + 1e-9)
+    if noise_floor_db > 0.0:
+        # A real dBFS noise floor can't be positive - this means the caller passed
+        # samples that were never level-normalized (e.g. raw int16 PCM instead of
+        # a signal scaled via normalize_analysis_level first).
+        warnings.warn(
+            f"estimate_noise_floor_db got an implausible positive result ({noise_floor_db:.1f} dB); "
+            "input samples are probably not level-normalized to a +/-1.0 range.",
+            stacklevel=2,
+        )
+    return noise_floor_db
 
 
 def calibrate_silence_threshold_db(samples, sample_rate, margin_db=10.0,

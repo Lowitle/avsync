@@ -168,8 +168,24 @@ trazabilidad, no velocidad de proceso.
           invisible para el umbral fijo -35 dB, pero el umbral calibrado
           (-25 dB, suelo de ruido -27.5 dB) la reconoce y el empalme por pista
           la usa correctamente; sin calibrar, no se reubica nada.
-       - Pendiente: validar con audio real (episodio con pista de baja calidad)
-          antes de considerar promoverlo a comportamiento por defecto.
+       - Bug encontrado y corregido (30/08, primera prueba con audio real): el
+          umbral de frontera de contenido calibraba sobre PCM crudo sin pasar
+          por `normalize_analysis_level`, dando suelos de ruido positivos sin
+          sentido (p.ej. +40 dB) y por tanto un umbral mal calculado (delay
+          E02 2.044s -> 2.353s, warning de duracion +0.342s). Corregido
+          normalizando antes de calibrar, igual que los otros dos puntos de
+          uso. Se añadio tambien un aviso (`warnings.warn`) en
+          `estimate_noise_floor_db` si el resultado es positivo, para detectar
+          este tipo de error de inmediato en el futuro.
+       - Validado con audio real tras el fix (S01E01, S01E02, pista primary
+          spa unica): umbrales calibrados mas estrictos que el fijo en ambos
+          casos (E01: ref -30.2dB/spa -31.4dB; E02: ref -27.5dB/spa -32.0dB).
+          Delay y duracion final casi identicos al baseline de umbral fijo
+          (diferencias de 11-28ms en el delay, 0.013s/0.056s de diferencia de
+          duracion, ambos dentro de margen seguro, sin warnings).
+       - Pendiente: validar con una pista de baja calidad conocida (mas
+          ruidosa que las de S01E01/E02) antes de considerar promoverlo a
+          comportamiento por defecto.
 
 4. Validacion obligatoria por iteracion.
     - Probar primero en S01E02 y comparar anclas/receta contra el checkpoint

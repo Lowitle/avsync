@@ -3532,8 +3532,13 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             foreign_sr, foreign_boundary_audio = wavfile.read(foreign_wav_analysis)
             ref_boundary_mono = ref_boundary_audio.mean(axis=1) if ref_boundary_audio.ndim == 2 else ref_boundary_audio
             foreign_boundary_mono = foreign_boundary_audio.mean(axis=1) if foreign_boundary_audio.ndim == 2 else foreign_boundary_audio
-            ref_boundary_threshold, ref_noise_floor_db = aa.calibrate_silence_threshold_db(ref_boundary_mono, ref_sr)
-            foreign_boundary_threshold, foreign_noise_floor_db = aa.calibrate_silence_threshold_db(foreign_boundary_mono, foreign_sr)
+            # calibrate_silence_threshold_db expects a level-normalized signal (like the other
+            # two calibration call sites), not raw PCM - otherwise the RMS is measured against
+            # int16 full-scale instead of 1.0 and produces a nonsensical positive "dB" floor.
+            ref_boundary_analysis = aa.normalize_analysis_level(ref_boundary_mono)
+            foreign_boundary_analysis = aa.normalize_analysis_level(foreign_boundary_mono)
+            ref_boundary_threshold, ref_noise_floor_db = aa.calibrate_silence_threshold_db(ref_boundary_analysis, ref_sr)
+            foreign_boundary_threshold, foreign_noise_floor_db = aa.calibrate_silence_threshold_db(foreign_boundary_analysis, foreign_sr)
             logger.info(f"  Auto-calibrated boundary threshold: reference {ref_boundary_threshold:.1f} dB "
                         f"(noise floor {ref_noise_floor_db:.1f} dB), foreign {foreign_boundary_threshold:.1f} dB "
                         f"(noise floor {foreign_noise_floor_db:.1f} dB)")
