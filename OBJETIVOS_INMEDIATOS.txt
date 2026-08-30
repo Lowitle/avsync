@@ -146,6 +146,30 @@ trazabilidad, no velocidad de proceso.
     - Estimar suelo de ruido y rango dinamico de cada pista en tramos confirmados.
     - Derivar el umbral de silencio en vez de fijar siempre -40 dBFS.
     - Mantener los valores calculados en el log/CSV para revision.
+    - Estado: IMPLEMENTADO, opt-in via `--auto_silence_threshold` (por defecto
+       sigue usando los valores fijos -40/-35 dBFS; no se promueve a default
+       hasta validarlo con audio real).
+       - `audio_alignment.estimate_noise_floor_db`: percentil 5 de energia RMS
+          por frame (20ms) de la propia pista, sin asumir ningun suelo de ruido
+          fijo.
+       - `audio_alignment.calibrate_silence_threshold_db`: umbral = suelo de
+          ruido + margen de 10 dB, acotado entre -60 y -25 dBFS para evitar
+          valores inutilizables ante una medicion patologica.
+       - Aplicado en 3 puntos: el umbral de frontera de contenido
+          (`find_audio_start_end`, calibrado por separado para reference y
+          foreign), y el umbral de silencio usado por el empalme por pista
+          (`_move_replacements_to_quiet_primary_splices` y
+          `_localize_replacements_for_track`, calibrado por separado para
+          reference y para cada pista foreign).
+       - `--threshold_calibration_csv` vuelca suelo de ruido + umbral derivado
+          de cada pista analizada, para revision manual.
+       - Validado con `test_auto_silence_threshold.py` (sintetico,
+          determinista): una pausa real con ruido de fondo a -32.8 dB queda
+          invisible para el umbral fijo -35 dB, pero el umbral calibrado
+          (-25 dB, suelo de ruido -27.5 dB) la reconoce y el empalme por pista
+          la usa correctamente; sin calibrar, no se reubica nada.
+       - Pendiente: validar con audio real (episodio con pista de baja calidad)
+          antes de considerar promoverlo a comportamiento por defecto.
 
 4. Validacion obligatoria por iteracion.
     - Probar primero en S01E02 y comparar anclas/receta contra el checkpoint

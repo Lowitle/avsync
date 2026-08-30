@@ -200,6 +200,39 @@ def _envelope(samples, sample_rate):
     return envelope, sample_rate / hop
 
 
+def estimate_noise_floor_db(samples, sample_rate, frame_seconds=0.02, percentile=5.0):
+    """Estimate a track's noise floor from its quietest sustained frames.
+
+    Returns the dB level at the given low percentile of per-frame RMS energy -
+    a data-driven proxy for "how quiet this specific track actually gets",
+    instead of assuming every source shares the same fixed dBFS noise floor.
+    """
+    samples = np.asarray(samples, dtype=np.float64)
+    frame_size = max(1, int(round(frame_seconds * sample_rate)))
+    frame_count = len(samples) // frame_size
+    if frame_count == 0:
+        return -90.0
+    frames = samples[:frame_count * frame_size].reshape(frame_count, frame_size)
+    rms = np.sqrt(np.mean(np.square(frames), axis=1))
+    floor_rms = np.percentile(rms, percentile)
+    return 20.0 * np.log10(floor_rms + 1e-9)
+
+
+def calibrate_silence_threshold_db(samples, sample_rate, margin_db=10.0,
+                                    min_threshold_db=-60.0, max_threshold_db=-25.0):
+    """Derive a silence threshold from a track's own measured noise floor.
+
+    A hissier source needs a higher (less negative) threshold to recognize its
+    own pauses as silence; a very clean source can use a lower one. The result
+    is clamped to a sane range so a pathological measurement (e.g. a mostly-
+    silent clip) can't produce an unusably high or low threshold. Returns
+    ``(threshold_db, noise_floor_db)`` so callers can log both.
+    """
+    noise_floor_db = estimate_noise_floor_db(samples, sample_rate)
+    threshold_db = max(min_threshold_db, min(max_threshold_db, noise_floor_db + margin_db))
+    return threshold_db, noise_floor_db
+
+
 def is_safe_splice_point(samples, sample_rate, time_seconds, threshold_db=-35.0,
                           window_seconds=0.15):
     """Check whether hard-cutting ``samples`` at ``time_seconds`` lands on a natural pause.

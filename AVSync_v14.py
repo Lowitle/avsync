@@ -478,6 +478,7 @@ ANCHOR_FOLLOW_FORWARD_WINDOW_S = 10.0 # Seconds forward from estimated position 
 AUDIO_REPLACEMENT_RANGES = [] # Reference intervals to fill from the reference audio when foreign content is missing
 AUDIO_EDITORIAL_EDITS = [] # Explicit source-timeline edits shared with subtitle retiming
 AUDIO_EDITORIAL_SOURCE_TEMPO = 1.0
+THRESHOLD_CALIBRATION_LOG = [] # (label, noise_floor_db, threshold_db) rows for --threshold_calibration_csv
 
 # Logger will be initialized in main() with proper file output
 # Use a temporary logger for early errors
@@ -2866,11 +2867,11 @@ def _find_low_energy_splice(samples, sample_rate, center_time, search_seconds=1.
     return min(scored, default=(None, None, None, None))
 
 
-def _find_nearby_quiet_interval(samples, sample_rate, center_time, search_seconds=3.0):
+def _find_nearby_quiet_interval(samples, sample_rate, center_time, search_seconds=3.0, threshold_db=-35.0):
     """Return the longest sustained quiet interval near a splice, for reporting only."""
     aa = _import_audio_alignment()
     intervals = aa.detect_silence_intervals(
-        samples, sample_rate, threshold_db=-35.0, min_duration=0.2)
+        samples, sample_rate, threshold_db=threshold_db, min_duration=0.2)
     nearby = [
         interval for interval in intervals
         if interval[1] >= center_time - search_seconds and interval[0] <= center_time + search_seconds
@@ -2878,6 +2879,27 @@ def _find_nearby_quiet_interval(samples, sample_rate, center_time, search_second
     if not nearby:
         return None
     return max(nearby, key=lambda interval: (interval[1] - interval[0], -abs((interval[0] + interval[1]) / 2 - center_time)))
+
+
+def _record_threshold_calibration(label, noise_floor_db, threshold_db):
+    """Record one --auto_silence_threshold measurement for the optional CSV export."""
+    THRESHOLD_CALIBRATION_LOG.append((label, noise_floor_db, threshold_db))
+
+
+def write_threshold_calibration_csv(path):
+    """Write every recorded noise-floor/threshold calibration to a CSV for manual review."""
+    if not THRESHOLD_CALIBRATION_LOG:
+        logger.info("  No threshold calibration data recorded; skipping --threshold_calibration_csv.")
+        return
+    try:
+        with open(path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["label", "noise_floor_db", "threshold_db"])
+            for label, noise_floor_db, threshold_db in THRESHOLD_CALIBRATION_LOG:
+                writer.writerow([label, f"{noise_floor_db:.1f}", f"{threshold_db:.1f}"])
+        logger.info(f"  -> Wrote {len(THRESHOLD_CALIBRATION_LOG)} threshold calibration row(s) to {path}")
+    except Exception as error:
+        logger.error(f"-> Failed to write threshold calibration CSV: {error}")
 
 
 def _move_replacements_to_quiet_primary_splices(args, anchors, reference_wav, foreign_wav):
@@ -2901,7 +2923,20 @@ def _move_replacements_to_quiet_primary_splices(args, anchors, reference_wav, fo
     foreign_mono = foreign_audio.mean(axis=1) if foreign_audio.ndim == 2 else foreign_audio
     reference_analysis = aa.normalize_analysis_level(reference_mono)
     foreign_analysis = aa.normalize_analysis_level(foreign_mono)
-    reference_silences = aa.detect_silence_intervals(reference_analysis, sample_rate, threshold_db=-35.0, min_duration=0.2)
+    reference_silence_threshold_db = -35.0
+    foreign_quiet_threshold_db = -35.0
+    if args.auto_silence_threshold:
+        reference_silence_threshold_db, reference_noise_floor_db = aa.calibrate_silence_threshold_db(
+            reference_analysis, sample_rate)
+        foreign_quiet_threshold_db, foreign_noise_floor_db = aa.calibrate_silence_threshold_db(
+            foreign_analysis, sample_rate)
+        logger.info(f"  Auto-calibrated splice threshold: reference {reference_silence_threshold_db:.1f} dB "
+                    f"(noise floor {reference_noise_floor_db:.1f} dB), primary foreign "
+                    f"{foreign_quiet_threshold_db:.1f} dB (noise floor {foreign_noise_floor_db:.1f} dB)")
+        _record_threshold_calibration("reference (primary splice)", reference_noise_floor_db, reference_silence_threshold_db)
+        _record_threshold_calibration("primary foreign (splice)", foreign_noise_floor_db, foreign_quiet_threshold_db)
+    reference_silences = aa.detect_silence_intervals(
+        reference_analysis, sample_rate, threshold_db=reference_silence_threshold_db, min_duration=0.2)
     tempo = AUDIO_EDITORIAL_SOURCE_TEMPO if AUDIO_EDITORIAL_SOURCE_TEMPO > 0 else 1.0
     moved = []
     for replacement in AUDIO_REPLACEMENT_RANGES:
@@ -2913,7 +2948,8 @@ def _move_replacements_to_quiet_primary_splices(args, anchors, reference_wav, fo
         replacement.setdefault("original_foreign_splice_time", source_time)
         replacement.setdefault("original_ref_start", replacement["ref_start"])
         replacement.setdefault("original_ref_end", replacement["ref_end"])
-        quiet_interval = _find_nearby_quiet_interval(foreign_analysis, sample_rate, source_time)
+        quiet_interval = _find_nearby_quiet_interval(
+            foreign_analysis, sample_rate, source_time, threshold_db=foreign_quiet_threshold_db)
         if quiet_interval is None:
             continue
         candidate_source = (quiet_interval[0] + quiet_interval[1]) / 2.0
@@ -2978,7 +3014,20 @@ def _localize_replacements_for_track(args, final_segment_anchors, ref_wav_analys
     track_mono = track_audio.mean(axis=1) if track_audio.ndim == 2 else track_audio
     reference_analysis = aa.normalize_analysis_level(reference_mono)
     track_analysis = aa.normalize_analysis_level(track_mono)
-    reference_silences = aa.detect_silence_intervals(reference_analysis, sample_rate, threshold_db=-35.0, min_duration=0.2)
+    reference_silence_threshold_db = -35.0
+    track_quiet_threshold_db = -35.0
+    if args.auto_silence_threshold:
+        reference_silence_threshold_db, reference_noise_floor_db = aa.calibrate_silence_threshold_db(
+            reference_analysis, sample_rate)
+        track_quiet_threshold_db, track_noise_floor_db = aa.calibrate_silence_threshold_db(
+            track_analysis, sample_rate)
+        logger.info(f"  Auto-calibrated splice threshold ({track_label}): reference "
+                    f"{reference_silence_threshold_db:.1f} dB (noise floor {reference_noise_floor_db:.1f} dB), "
+                    f"track {track_quiet_threshold_db:.1f} dB (noise floor {track_noise_floor_db:.1f} dB)")
+        _record_threshold_calibration(f"reference (splice, {track_label})", reference_noise_floor_db, reference_silence_threshold_db)
+        _record_threshold_calibration(f"{track_label} (splice)", track_noise_floor_db, track_quiet_threshold_db)
+    reference_silences = aa.detect_silence_intervals(
+        reference_analysis, sample_rate, threshold_db=reference_silence_threshold_db, min_duration=0.2)
     tempo = AUDIO_EDITORIAL_SOURCE_TEMPO if AUDIO_EDITORIAL_SOURCE_TEMPO > 0 else 1.0
 
     adjusted = list(final_segment_anchors)
@@ -2989,7 +3038,8 @@ def _localize_replacements_for_track(args, final_segment_anchors, ref_wav_analys
         base_ref_end = replacement.get("original_ref_end", replacement["ref_end"])
         if base_source_time is None:
             continue
-        quiet_interval = _find_nearby_quiet_interval(track_analysis, sample_rate, base_source_time)
+        quiet_interval = _find_nearby_quiet_interval(
+            track_analysis, sample_rate, base_source_time, threshold_db=track_quiet_threshold_db)
         if quiet_interval is None:
             continue
         candidate_source = (quiet_interval[0] + quiet_interval[1]) / 2.0
@@ -3473,9 +3523,30 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     # --- Step 3: Detect Audio Boundaries ---
     visual_anchors_details = _move_replacements_to_quiet_primary_splices(
         args, visual_anchors_details, ref_wav_analysis, foreign_wav_analysis)
-    logger.info(f"--- Detecting Audio Content Boundaries (Threshold: {db_threshold} dB) ---")
-    ref_start_s, ref_end_s = find_audio_start_end(ref_wav_analysis, db_threshold)
-    foreign_start_s, foreign_end_s = find_audio_start_end(foreign_wav_analysis, db_threshold)
+    ref_boundary_threshold = db_threshold
+    foreign_boundary_threshold = db_threshold
+    if args.auto_silence_threshold:
+        aa = _import_audio_alignment()
+        try:
+            ref_sr, ref_boundary_audio = wavfile.read(ref_wav_analysis)
+            foreign_sr, foreign_boundary_audio = wavfile.read(foreign_wav_analysis)
+            ref_boundary_mono = ref_boundary_audio.mean(axis=1) if ref_boundary_audio.ndim == 2 else ref_boundary_audio
+            foreign_boundary_mono = foreign_boundary_audio.mean(axis=1) if foreign_boundary_audio.ndim == 2 else foreign_boundary_audio
+            ref_boundary_threshold, ref_noise_floor_db = aa.calibrate_silence_threshold_db(ref_boundary_mono, ref_sr)
+            foreign_boundary_threshold, foreign_noise_floor_db = aa.calibrate_silence_threshold_db(foreign_boundary_mono, foreign_sr)
+            logger.info(f"  Auto-calibrated boundary threshold: reference {ref_boundary_threshold:.1f} dB "
+                        f"(noise floor {ref_noise_floor_db:.1f} dB), foreign {foreign_boundary_threshold:.1f} dB "
+                        f"(noise floor {foreign_noise_floor_db:.1f} dB)")
+            _record_threshold_calibration("reference (boundary)", ref_noise_floor_db, ref_boundary_threshold)
+            _record_threshold_calibration("foreign (boundary)", foreign_noise_floor_db, foreign_boundary_threshold)
+        except Exception as error:
+            logger.warning(f"  Auto silence-threshold calibration skipped, using fixed {db_threshold} dB: {error}")
+            ref_boundary_threshold = db_threshold
+            foreign_boundary_threshold = db_threshold
+    logger.info(f"--- Detecting Audio Content Boundaries (Reference: {ref_boundary_threshold:.1f} dB, "
+                f"Foreign: {foreign_boundary_threshold:.1f} dB) ---")
+    ref_start_s, ref_end_s = find_audio_start_end(ref_wav_analysis, ref_boundary_threshold)
+    foreign_start_s, foreign_end_s = find_audio_start_end(foreign_wav_analysis, foreign_boundary_threshold)
 
 
     if ref_start_s is None or foreign_start_s is None:
@@ -4916,6 +4987,12 @@ Workflow:
     parser.add_argument("--no_per_track_splice_placement", dest="per_track_splice_placement",
         action="store_false", default=True,
         help="Disable automatic primary-track splice placement inside verified reference silences.")
+    parser.add_argument("--auto_silence_threshold", action="store_true",
+        help="Experimental: derive the silence/boundary threshold per track from its own measured "
+             "noise floor instead of a fixed -40/-35 dBFS value. Disabled by default.")
+    parser.add_argument("--threshold_calibration_csv", metavar="CSV_PATH", default=None,
+        help="Optional: write the noise floor and derived threshold computed for each analyzed "
+             "track when --auto_silence_threshold is enabled.")
     parser.add_argument("--no_subtitles", action='store_true', help="Skip subtitle synchronization (enabled by default)")
 
     parser.add_argument("--qc_output_dir", metavar="QC_DIR", default=None, help="Optional: Directory to save side-by-side QC images. By default, no QC images are generated.")
@@ -5393,6 +5470,9 @@ Workflow:
                 else:
                     logger.warning(f"Failed to sync additional track #{track['stream_idx']} ({track['language']}). "
                                  f"It will be excluded from the output.")
+
+        if args.threshold_calibration_csv:
+            write_threshold_calibration_csv(args.threshold_calibration_csv)
 
         # === Stage 3: Muxing (Now the default final step) ===
         if audio_sync_success:

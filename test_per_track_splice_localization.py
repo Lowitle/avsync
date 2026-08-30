@@ -63,6 +63,7 @@ def main():
 
         class Args:
             per_track_splice_placement = True
+            auto_silence_threshold = False
 
         final_segment_anchors = [
             (0.0, 0.0),
