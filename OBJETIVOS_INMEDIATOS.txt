@@ -211,6 +211,19 @@ trazabilidad, no velocidad de proceso.
          decodificado de la pista sincronizada entre una version ya validada y
          una nueva corrida detecta cualquier cambio real de contenido/tiempos,
          incluso cuando la duracion total coincide.
+      - Batch completo S01 lanzado (30/08, noche): sin pista de audio mas
+         ruidosa disponible para validar mejor el punto 3, se decide pasar
+         directamente a validar la temporada completa con la configuracion ya
+         validada (sin `--auto_silence_threshold`, sigue opt-in). Layout de
+         streams verificado identico en los 22 episodios de ambos lados
+         (ref stream #1 eac3 eng; foreign stream #1 mp3 spa, stream #2 ac3 eng
+         de anclaje). Comando: `AVSync_batch.py <ref_dir> <foreign_dir>
+         S01_batch_output --per_episode_csv --ref_stream_idx 1
+         --foreign_stream_idx 1 --foreign_anchor_stream_idx 2 --foreign_lang
+         spa --anchor_source audio --verbose`. Salida en carpeta nueva
+         `S01_batch_output` (no reutiliza `S01_sincronizada`, que ya tiene
+         experimentos con nombres manuales). Pendiente: revisar los 22 logs y
+         escuchar puntos de reemplazo/transicion tras completar.
       - Pendiente: aun no se ha ejecutado el batch completo de la temporada; seguir
          validando episodio a episodio antes de ese paso.
 
