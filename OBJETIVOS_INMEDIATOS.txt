@@ -133,8 +133,14 @@ trazabilidad, no velocidad de proceso.
             aplica cuando existe una receta editorial de transiciones
             (`AUDIO_EDITORIAL_EDITS`, caso E02); ahi las pistas adicionales siguen
             la receta unificada sin busqueda de borde propio.
-         - Pendiente: validar a oido con una segunda pista foreign real (no solo
-            compilacion) antes del proximo checkpoint.
+         - Validacion: en vez de un tercer audio artificial en video real, se creo
+            `test_per_track_splice_localization.py`, una prueba sintetica y
+            deterministica que llama directamente a `_localize_replacements_for_track`
+            con un silencio de referencia compartido y dos pistas foreign con pausas
+            en sitios distintos. Confirma que la pista adicional ignora el borde ya
+            elegido por la primary (que en la prueba cae sobre voz) y se reubica en
+            su propio hueco, sin romper el orden de las anclas. Suficiente para dar
+            la logica por validada; queda commiteada como regresion reutilizable.
 
 3. Calibrar umbrales por episodio a partir de anclas limpias.
     - Estimar suelo de ruido y rango dinamico de cada pista en tramos confirmados.
@@ -147,8 +153,26 @@ trazabilidad, no velocidad de proceso.
     - Revisar a oido el tramo ~19:30 hasta el final antes de aplicar el cambio a
        otro episodio.
     - No volver a ejecutar el batch completo hasta que esta zona sea estable.
-      - Estado de E02: final corregido por el punto 2; pendiente de validar la
-         transicion de 10:15 y revisar a oido desde ~10:30.
+      - Estado de E02: final corregido por el punto 2; transicion de 10:15/10:35
+         corregida y validada a oido (ver 2.1, `E02_unified_transition_evidence`).
+      - Estado de E01: regresion aislada validada a oido tras los cambios de
+         transicion y tras promover el empalme por pista de la primary (ver 2.2).
+      - Regresion post-empalme-por-pista-en-adicionales (30/08, tarde): re-ejecutados
+         E01 y E02 con los mismos flags que las corridas validadas. E01 dio MD5
+         identico al audio ya validado (misma pista, sin cambios). E02 dio un MD5
+         distinto al `E02_unified_transition_evidence` original, pero por motivo
+         esperado: esa corrida es anterior a la existencia del empalme por pista
+         (2.2), asi que hoy se le aplico por primera vez y reubico dos rellenos
+         (ref 133.893s-137.533s y 633.433s-635.030s) a pausas mas silenciosas de
+         la propia pista española. La deteccion de transiciones en si (mismos
+         puntos 134.950s-138.590s, 635.450s-637.046s, 1219.900s) fue identica en
+         ambos logs. Validado a oido en ambos puntos nuevos: correcto.
+      - Tecnica util para el futuro: comparar `ffmpeg -f md5` del audio ya
+         decodificado de la pista sincronizada entre una version ya validada y
+         una nueva corrida detecta cualquier cambio real de contenido/tiempos,
+         incluso cuando la duracion total coincide.
+      - Pendiente: aun no se ha ejecutado el batch completo de la temporada; seguir
+         validando episodio a episodio antes de ese paso.
 
 ## HISTORICO - OBJETIVOS ANTERIORES IMPLEMENTADOS
 
