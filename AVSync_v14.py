@@ -945,7 +945,7 @@ def parse_foreign_tracks_arg(foreign_tracks_str, video_path, primary_stream_idx=
     return selected
 
 
-def sync_additional_track(foreign_video, stream_idx, final_segment_anchors, ref_delay_s,
+def sync_additional_track(args, foreign_video, stream_idx, final_segment_anchors, ref_delay_s,
                           temp_dir, track_label="additional"):
     """
     Sync an additional foreign audio track using pre-computed segment anchors.
@@ -990,6 +990,32 @@ def sync_additional_track(foreign_video, stream_idx, final_segment_anchors, ref_
     ]
     if not run_ffmpeg(extract_cmd, f"Extract Additional Track #{stream_idx}")[0]:
         return None
+
+    # Let this track pick its own quiet splice point for each relocated replacement, rather
+    # than blindly reusing the primary track's boundary (a safe pause in one dub can still
+    # contain dialogue in another).
+    track_final_segment_anchors = final_segment_anchors
+    if args.per_track_splice_placement and AUDIO_REPLACEMENT_RANGES and not AUDIO_EDITORIAL_EDITS:
+        ref_wav_analysis = os.path.join(temp_dir, "ref_audio_analysis.wav")
+        if os.path.exists(ref_wav_analysis):
+            track_wav_analysis = os.path.join(track_temp_dir, f"foreign_analysis_{stream_idx}.wav")
+            loudness_filter = 'loudnorm=I=-23:TP=-1.5:LRA=11'
+            audio_filter_chain = f'{aresample_filter},{loudness_filter}'
+            extract_cmd_analysis = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+                "-i", foreign_video,
+                "-map", f"0:{stream_idx}",
+                "-vn",
+                "-c:a", "pcm_s16le", "-ar", str(DEFAULT_SAMPLE_RATE), "-ac", str(DEFAULT_CHANNELS),
+                "-af", audio_filter_chain, "-y", "-f", "wav", track_wav_analysis
+            ]
+            if run_ffmpeg(extract_cmd_analysis, f"Extract Additional Track #{stream_idx} (Analysis Copy)")[0]:
+                track_final_segment_anchors = _localize_replacements_for_track(
+                    args, final_segment_anchors, ref_wav_analysis, track_wav_analysis, track_label)
+            else:
+                logger.warning(f"  Failed to extract analysis copy for {track_label}; using shared splice placement.")
+        else:
+            logger.debug(f"  Reference analysis WAV unavailable; using shared splice placement for {track_label}.")
 
     # Reuse the primary track's explicit editorial recipe when available. This
     # keeps all foreign tracks on the same cut/insert timeline.
@@ -1050,8 +1076,8 @@ def sync_additional_track(foreign_video, stream_idx, final_segment_anchors, ref_
     
     for i in range(num_segments):
         segment_num = i + 1
-        ref_start, foreign_start = final_segment_anchors[i]
-        ref_end, foreign_end = final_segment_anchors[i + 1]
+        ref_start, foreign_start = track_final_segment_anchors[i]
+        ref_end, foreign_end = track_final_segment_anchors[i + 1]
         target_ref_duration = ref_end - ref_start
         
         # Use the same iterative processing as the primary track
@@ -1769,7 +1795,7 @@ def _direct_similarity(a, b):
     return float(np.dot(a, b) / denom)
 
 
-def _locate_transition_point(reference, source, sample_rate, ref_lo, ref_hi,
+def _locate_transition_point(reference, source, aa, sample_rate, ref_lo, ref_hi,
                               offset_before, offset_after,
                               probe_window_seconds=1.0, precision_seconds=0.02, max_iterations=25):
     """Binary-search the exact reference time where content switches from offset_before
@@ -1781,6 +1807,88 @@ def _locate_transition_point(reference, source, sample_rate, ref_lo, ref_hi,
     the remaining [lo, hi] gap biases the result by up to half the window size, since it then
     straddles content from both sides of the true transition.
     """
+    def _measure_state(probe_ref_time, expected_offset, window_seconds=4.0):
+        window_samples = int(window_seconds * sample_rate)
+        ref_start = int(probe_ref_time * sample_rate)
+        ref_end = ref_start + window_samples
+        source_start = int((probe_ref_time + expected_offset) * sample_rate)
+        source_end = source_start + window_samples
+        if (ref_start < 0 or ref_end > len(reference)
+                or source_start < 0 or source_end > len(source)):
+            return None
+        reference_window = reference[ref_start:ref_end]
+        source_window = source[source_start:source_end]
+        waveform_similarity = _direct_similarity(reference_window, source_window)
+        reference_envelope, envelope_rate = aa._envelope(reference_window, sample_rate)
+        source_envelope, _ = aa._envelope(source_window, sample_rate)
+        envelope_similarity = (_direct_similarity(reference_envelope, source_envelope)
+                               if len(reference_envelope) and len(source_envelope) else -1.0)
+        return {
+            "matches_expected": max(waveform_similarity, envelope_similarity) >= 0.15,
+            "waveform_similarity": waveform_similarity,
+            "envelope_similarity": envelope_similarity,
+        }
+
+    # A binary search is unreliable across a quiet/ambiguous interval: it can select an
+    # arbitrary midpoint rather than the natural pause between two otherwise stable states.
+    # First find consecutive one-second probes that independently favor each endpoint
+    # offset, then place the edit at the lowest-energy point between those two runs.
+    state_samples = []
+    for probe_time in np.arange(ref_lo, ref_hi + 1e-6, 1.0):
+        before_measurement = _measure_state(probe_time, offset_before)
+        after_measurement = _measure_state(probe_time, offset_after)
+        if before_measurement is None or after_measurement is None:
+            continue
+        before_matches = before_measurement["matches_expected"]
+        after_matches = after_measurement["matches_expected"]
+        if before_matches and not after_matches:
+            state = "before"
+        elif after_matches and not before_matches:
+            state = "after"
+        else:
+            state = "ambiguous"
+        logger.debug(
+            f"    Transition probe ref {probe_time:.3f}s: {state}; "
+            f"before W={before_measurement['waveform_similarity']:+.3f}, "
+            f"E={before_measurement['envelope_similarity']:+.3f}; "
+            f"after W={after_measurement['waveform_similarity']:+.3f}, "
+            f"E={after_measurement['envelope_similarity']:+.3f}"
+        )
+        state_samples.append((probe_time, state))
+
+    def _runs_for(state):
+        runs = []
+        current = []
+        for sample in state_samples:
+            if sample[1] == state:
+                if current and sample[0] - current[-1][0] > 1.01:
+                    current = []
+                current.append(sample)
+            elif current:
+                if len(current) >= 2:
+                    runs.append(current)
+                current = []
+        if len(current) >= 2:
+            runs.append(current)
+        return runs
+
+    before_runs = _runs_for("before")
+    after_runs = _runs_for("after")
+    for before_run in reversed(before_runs):
+        for after_run in after_runs:
+            band_start = before_run[-1][0]
+            band_end = after_run[0][0]
+            if 0 < band_end - band_start <= 45.0:
+                start_sample = int(band_start * sample_rate)
+                end_sample = int(band_end * sample_rate)
+                frame_samples = max(1, int(0.05 * sample_rate))
+                samples = reference[start_sample:end_sample]
+                frame_count = len(samples) // frame_samples
+                if frame_count:
+                    frames = samples[:frame_count * frame_samples].reshape(frame_count, frame_samples)
+                    rms = np.sqrt(np.mean(np.square(frames.astype(np.float64)), axis=1))
+                    return band_start + int(np.argmin(rms)) * 0.05, True
+
     def _matches_before(probe_ref_time, window_samples):
         ref_start = int(probe_ref_time * sample_rate)
         ref_end = ref_start + window_samples
@@ -1817,7 +1925,7 @@ def _locate_transition_point(reference, source, sample_rate, ref_lo, ref_hi,
         else:
             hi = mid
 
-    return (lo + hi) / 2.0
+    return (lo + hi) / 2.0, False
 
 
 def _measure_local_audio_offset(reference, source, aa, sample_rate, ref_time,
@@ -1857,6 +1965,69 @@ def _measure_local_audio_offset(reference, source, aa, sample_rate, ref_time,
     return (envelope_offset, envelope_confidence) if envelope_confidence >= waveform_confidence else (waveform_offset, waveform_confidence)
 
 
+def _write_transition_report_csv(path, reference, source, aa, sample_rate, anchor_offsets,
+                                 anchors, jump_tolerance_seconds):
+    """Write local one-second measurements for coarse anchor intervals up to one minute.
+
+    This includes intervals whose endpoint offsets look stable: an editorial
+    transition can occur inside a 30-second segment and be hidden when both
+    coarse anchors happen to land on the same side of it.
+    """
+    rows = []
+    pairs = sorted(zip(anchors, anchor_offsets), key=lambda pair: pair[0][2])
+    for (left_anchor, left_offset), (right_anchor, right_offset) in zip(pairs, pairs[1:]):
+        ref_start = left_anchor[2]
+        ref_end = right_anchor[2]
+        if ref_end - ref_start > 60.0:
+            continue
+        # Probe through the right anchor. The 4s window then crosses into the
+        # post-transition material instead of ending four seconds before it.
+        for ref_time in np.arange(ref_start, ref_end + 1e-6, 1.0):
+            fraction = min(1.0, (ref_time - ref_start) / max(1e-9, ref_end - ref_start))
+            expected_offset = left_offset + fraction * (right_offset - left_offset)
+            window_start = int(ref_time * sample_rate)
+            window_end = window_start + int(4.0 * sample_rate)
+            reference_window = reference[window_start:window_end]
+            if len(reference_window) < int(4.0 * sample_rate):
+                continue
+            source_start = max(0, int((ref_time + expected_offset - 5.0) * sample_rate))
+            source_end = min(len(source), int((ref_time + expected_offset + 9.0) * sample_rate))
+            source_window = source[source_start:source_end]
+            if len(source_window) < len(reference_window):
+                continue
+            try:
+                waveform_offset, waveform_confidence = aa.correlate_offset(
+                    reference_window, source_window, sample_rate)
+                envelope_offset, envelope_confidence = aa.correlate_envelope_offset(
+                    reference_window, source_window, sample_rate)
+            except ValueError:
+                continue
+            source_start_seconds = source_start / sample_rate
+            waveform_offset += source_start_seconds - ref_time
+            envelope_offset += source_start_seconds - ref_time
+            reference_rms = np.sqrt(np.mean(np.square(reference_window.astype(np.float64))))
+            rows.append([
+                f"{ref_start:.3f}-{ref_end:.3f}", f"{left_offset:+.3f}",
+                f"{right_offset:+.3f}", f"{ref_time:.3f}",
+                f"{expected_offset:+.3f}", f"{waveform_offset:+.3f}",
+                f"{envelope_offset:+.3f}", f"{waveform_confidence:.2f}",
+                f"{envelope_confidence:.2f}",
+                f"{20.0 * np.log10(reference_rms + 1e-9):.1f}",
+            ])
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                "anchor_interval", "left_offset", "right_offset", "ref_time",
+                "interpolated_offset", "waveform_offset", "envelope_offset",
+                "waveform_confidence", "envelope_confidence", "reference_rms_db",
+            ])
+            writer.writerows(rows)
+        logger.info(f"  -> Wrote {len(rows)} local transition measurements to {path}")
+    except Exception as e:
+        logger.warning(f"  Failed to write transition report CSV: {e}")
+
+
 def _progressive_offset_probes(reference, source, aa, sample_rate, ref_lo, ref_hi,
                                offset_lo, offset_hi, jump_tolerance_seconds,
                                min_interval_seconds=2.0, max_depth=8):
@@ -1883,10 +2054,43 @@ def _progressive_offset_probes(reference, source, aa, sample_rate, ref_lo, ref_h
     return sorted(probes)
 
 
+def _has_two_sided_transition_evidence(reference, source, sample_rate, transition_time,
+                                       offset_before, offset_after, window_seconds=2.0):
+    """Confirm that a proposed cut separates its two endpoint offset states.
+
+    A negative offset jump creates a silence/reference fill only when a short
+    window before the cut prefers the old offset and a short window after it
+    prefers the new one. This prevents a coarse-window offset change from
+    creating a fill at an arbitrary point inside still-matching content.
+    """
+    window_samples = int(window_seconds * sample_rate)
+
+    def score_at(start_time, offset):
+        ref_start = int(start_time * sample_rate)
+        ref_end = ref_start + window_samples
+        source_start = int((start_time + offset) * sample_rate)
+        source_end = source_start + window_samples
+        if (ref_start < 0 or ref_end > len(reference)
+                or source_start < 0 or source_end > len(source)):
+            return None
+        return _direct_similarity(reference[ref_start:ref_end], source[source_start:source_end])
+
+    before_start = transition_time - window_seconds
+    after_start = transition_time + 0.05
+    before_old = score_at(before_start, offset_before)
+    before_new = score_at(before_start, offset_after)
+    after_old = score_at(after_start, offset_before)
+    after_new = score_at(after_start, offset_after)
+    if None in (before_old, before_new, after_old, after_new):
+        return False
+    margin = 0.06
+    return before_old >= 0.15 and before_old - before_new >= margin and after_new >= 0.15 and after_new - after_old >= margin
+
+
 def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, foreign_stream_idx,
                             source_tempo, window_seconds, step_seconds, min_confidence,
                             search_radius_seconds=20.0, agreement_seconds=0.15, jump_tolerance_seconds=0.15,
-                            anchor_report_csv=None):
+                            anchor_report_csv=None, transition_report_csv=None):
     """Generate sync anchors via audio cross-correlation instead of visual frame matching.
 
     Intended for pairs where resolution/compression/aspect-ratio mismatch makes template
@@ -1909,6 +2113,11 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
     reference = aa.extract_mono_audio(ref_video_path, ref_stream_idx, sample_rate, normalize_loudness=True)
     logger.info("  -> Extracting full foreign audio (tempo-corrected) for anchor analysis (with loudness normalization)...")
     source = aa.extract_mono_audio(foreign_video_path, foreign_stream_idx, sample_rate, tempo=source_tempo, normalize_loudness=True)
+    logger.info("  -> Extracting linear-gain analysis copies for correlation fallback...")
+    reference_linear = aa.normalize_analysis_level(
+        aa.extract_mono_audio(ref_video_path, ref_stream_idx, sample_rate))
+    source_linear = aa.normalize_analysis_level(
+        aa.extract_mono_audio(foreign_video_path, foreign_stream_idx, sample_rate, tempo=source_tempo))
 
     window_samples = int(window_seconds * sample_rate)
     step_samples = max(1, int(step_seconds * sample_rate))
@@ -1958,6 +2167,37 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
 
         best_confidence = max(waveform_confidence, envelope_confidence)
         candidate_offset = envelope_offset if envelope_confidence >= waveform_confidence else waveform_offset
+        used_linear_gain = False
+        both_reliable = waveform_confidence >= min_confidence and envelope_confidence >= min_confidence
+        needs_linear_retry = (
+            best_confidence < min_confidence
+            or (both_reliable and abs(waveform_offset - envelope_offset) > agreement_seconds)
+        )
+        if needs_linear_retry:
+            linear_reference_window = reference_linear[ref_start:ref_end]
+            linear_source_search = source_linear[search_start:search_end]
+            try:
+                linear_waveform_offset, linear_waveform_confidence = aa.correlate_offset(
+                    linear_reference_window, linear_source_search, sample_rate)
+                linear_envelope_offset, linear_envelope_confidence = aa.correlate_envelope_offset(
+                    linear_reference_window, linear_source_search, sample_rate)
+                linear_waveform_offset += search_start_seconds - ref_time
+                linear_envelope_offset += search_start_seconds - ref_time
+                linear_best_confidence = max(linear_waveform_confidence, linear_envelope_confidence)
+                linear_both_reliable = (linear_waveform_confidence >= min_confidence
+                                        and linear_envelope_confidence >= min_confidence)
+                if (linear_best_confidence >= min_confidence
+                        and (not linear_both_reliable
+                             or abs(linear_waveform_offset - linear_envelope_offset) <= agreement_seconds)):
+                    waveform_offset, waveform_confidence = linear_waveform_offset, linear_waveform_confidence
+                    envelope_offset, envelope_confidence = linear_envelope_offset, linear_envelope_confidence
+                    best_confidence = linear_best_confidence
+                    candidate_offset = (envelope_offset if envelope_confidence >= waveform_confidence
+                                        else waveform_offset)
+                    both_reliable = linear_both_reliable
+                    used_linear_gain = True
+            except ValueError:
+                pass
         # A window too weak to accept on its own correlation strength can still be trusted if
         # its offset lands almost exactly where the already-confirmed constant (FPS-corrected)
         # speed predicts it should be - that coincidence is itself strong corroborating evidence,
@@ -1971,7 +2211,6 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
         if best_confidence < min_confidence:
             if not (offset_matches_baseline and best_confidence >= relaxed_min_confidence):
                 continue
-        both_reliable = waveform_confidence >= min_confidence and envelope_confidence >= min_confidence
         if best_confidence >= min_confidence and both_reliable and abs(waveform_offset - envelope_offset) > agreement_seconds:
             logger.debug(f"    Window {ref_time:.1f}s: waveform/envelope disagree ({waveform_offset:.3f}s vs {envelope_offset:.3f}s), skipping.")
             continue
@@ -1980,6 +2219,8 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
             offset, method = envelope_offset, "envelope"
         else:
             offset, method = waveform_offset, "waveform"
+        if used_linear_gain:
+            method += " linear-gain"
         if best_confidence < min_confidence:
             method += " offset-consistency"
         else:
@@ -2114,6 +2355,68 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
                 f"confidence {partial_end_anchor.confidence:.2f})"
             )
 
+    # A 60-second window can hide a clean short match inside a mixed dialogue/music/silence
+    # section. Rescan only the resulting large gaps at 10-second windows every 5 seconds.
+    # Each dense measurement must agree with a direct neighbour before becoming an anchor;
+    # this rejects an isolated correlation peak while retaining continuous matching runs.
+    dense_gap_threshold = step_seconds
+    dense_window_seconds = 10.0
+    dense_step_seconds = 5.0
+    dense_min_confidence = 1.5
+    dense_candidates = []
+    anchor_pairs = sorted(zip(anchors, anchor_offsets), key=lambda pair: pair[0][2])
+    for (left_anchor, left_offset), (right_anchor, right_offset) in zip(anchor_pairs, anchor_pairs[1:]):
+        gap_start, gap_end = left_anchor[2], right_anchor[2]
+        if gap_end - gap_start <= dense_gap_threshold:
+            continue
+        gap_candidates = []
+        for dense_time in np.arange(gap_start + dense_step_seconds, gap_end - dense_window_seconds + 1e-6, dense_step_seconds):
+            fraction = (dense_time - gap_start) / (gap_end - gap_start)
+            expected_dense_offset = left_offset + fraction * (right_offset - left_offset)
+            source_start = max(0, int((dense_time + expected_dense_offset - 5.0) * sample_rate))
+            source_end = min(len(source), int((dense_time + expected_dense_offset + dense_window_seconds + 5.0) * sample_rate))
+            ref_start = int(dense_time * sample_rate)
+            ref_end = ref_start + int(dense_window_seconds * sample_rate)
+            if ref_end > len(reference) or source_end - source_start < ref_end - ref_start:
+                continue
+            try:
+                wave_offset, wave_confidence = aa.correlate_offset(
+                    reference[ref_start:ref_end], source[source_start:source_end], sample_rate)
+                envelope_offset, envelope_confidence = aa.correlate_envelope_offset(
+                    reference[ref_start:ref_end], source[source_start:source_end], sample_rate)
+            except ValueError:
+                continue
+            source_start_seconds = source_start / sample_rate
+            wave_offset += source_start_seconds - dense_time
+            envelope_offset += source_start_seconds - dense_time
+            best_confidence = max(wave_confidence, envelope_confidence)
+            if (best_confidence < dense_min_confidence
+                    or (wave_confidence >= dense_min_confidence
+                        and envelope_confidence >= dense_min_confidence
+                        and abs(wave_offset - envelope_offset) > agreement_seconds)):
+                continue
+            offset = envelope_offset if envelope_confidence >= wave_confidence else wave_offset
+            method = "envelope" if envelope_confidence >= wave_confidence else "waveform"
+            gap_candidates.append((dense_time, offset, best_confidence, method))
+
+        for candidate_index, candidate in enumerate(gap_candidates):
+            dense_time, offset, confidence, method = candidate
+            neighbours = gap_candidates[max(0, candidate_index - 1):candidate_index] + gap_candidates[candidate_index + 1:candidate_index + 2]
+            if not any(abs(offset - neighbour[1]) <= agreement_seconds for neighbour in neighbours):
+                continue
+            dense_candidates.append(candidate)
+
+    for dense_index, (dense_time, offset, confidence, method) in enumerate(dense_candidates, start=1):
+        foreign_time = (dense_time + offset) * source_tempo
+        anchors.append((f"AUDIO_DENSE_{dense_index:04d}_ref", f"AUDIO_DENSE_{dense_index:04d}_foreign", dense_time, foreign_time))
+        anchor_offsets.append(offset)
+        logger.info(f"  Dense anchor: ref {dense_time:.3f}s -> foreign {foreign_time:.3f}s "
+                    f"(offset {offset:+.3f}s, {method}, conf {confidence:.2f})")
+    if dense_candidates:
+        ordered_anchors = sorted(zip(anchors, anchor_offsets), key=lambda pair: pair[0][2])
+        anchors[:] = [item[0] for item in ordered_anchors]
+        anchor_offsets[:] = [item[1] for item in ordered_anchors]
+
     # Densify large stable gaps: a wide span between two anchors that broadly agree on offset
     # is usually safe to stretch smoothly, but relying on a single 60-120s atempo pass over it
     # is fragile if correlation confidence was only marginal throughout. Recover extra confirmed
@@ -2155,6 +2458,12 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
         insert_at = next((idx for idx, a in enumerate(anchors) if a[2] > ref_time), len(anchors))
         anchors.insert(insert_at, (f"{name}_ref", f"{name}_foreign", ref_time, foreign_time))
         anchor_offsets.insert(insert_at, offset)
+
+    if transition_report_csv:
+        _write_transition_report_csv(
+            transition_report_csv, reference, source, aa, sample_rate,
+            anchor_offsets, anchors, jump_tolerance_seconds,
+        )
 
     silence_differences = aa.compare_silence_profiles(
         reference,
@@ -2229,6 +2538,7 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
         if replacement_end - replacement_start > jump_tolerance_seconds:
             transition_count += 1
             replacement_id = f"AUDIO_REPLACEMENT_{transition_count:04d}"
+            replacement_foreign_time = 0.0
             # Copying HQ reference content only makes sense if the cut point is a
             # natural pause; otherwise it would hard-cut mid-note/mid-phrase.
             use_silence = not aa.is_safe_splice_point(reference, sample_rate, replacement_end)
@@ -2236,9 +2546,9 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
                 "id": replacement_id,
                 "ref_start": replacement_start,
                 "ref_end": replacement_end,
+                "foreign_splice_time": replacement_foreign_time,
                 "use_silence": use_silence,
             })
-            replacement_foreign_time = 0.0
             refined_anchors.append((f"{replacement_id}_a_ref", f"{replacement_id}_a_foreign",
                                      replacement_start, replacement_foreign_time))
             refined_anchors.append((f"{replacement_id}_b_ref", f"{replacement_id}_b_foreign",
@@ -2248,10 +2558,10 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
                         f"{replacement_end:.3f}s (initial offset {initial_offset:+.3f}s) -> "
                         f"filling it with {fill_desc} instead of stretching the first segment")
     elif abs(initial_jump) > jump_tolerance_seconds:
-        transition_ref_time = _locate_transition_point(
-            reference, source, sample_rate, 0.0, first_ref_time,
+        transition_ref_time, transition_validated = _locate_transition_point(
+            reference, source, aa, sample_rate, 0.0, first_ref_time,
             initial_offset, anchor_offsets[0])
-        if initial_jump < 0:
+        if initial_jump < 0 and transition_validated:
             missing_ref_duration = abs(initial_jump)
             replacement_start = transition_ref_time
             replacement_end = replacement_start + missing_ref_duration
@@ -2263,6 +2573,7 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
                     "id": replacement_id,
                     "ref_start": replacement_start,
                     "ref_end": replacement_end,
+                    "foreign_splice_time": replacement_foreign_time,
                     "use_silence": use_silence,
                 })
                 replacement_foreign_time = (replacement_start + initial_offset) * source_tempo
@@ -2301,12 +2612,19 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
 
     for ref_time_i, ref_time_j, offset_i, offset_j in progressive_candidates:
 
-        # The next accepted anchor already measures the new state. Searching
-        # beyond it allowed the old binary search to drift toward the midpoint
-        # of an unrelated extra window (e.g. reporting 750s for a cut at 720s).
-        search_hi = min(ref_time_j, len(reference) / sample_rate)
-        transition_ref_time = _locate_transition_point(
-            reference, source, sample_rate, ref_time_i, search_hi, offset_i, offset_j)
+        # A coarse anchor is evidence for its following window, not proof that a
+        # transition happened at its timestamp. When silence lies near that boundary,
+        # inspect into the next confirmed anchor (capped at 30s) to establish the
+        # post-transition state before choosing a cut point in the ambiguous band.
+        following_anchor_time = next(
+            (anchor[2] for anchor in anchors if anchor[2] > ref_time_j + 0.001),
+            ref_time_j + 30.0,
+        )
+        search_hi = min(following_anchor_time, ref_time_j + 30.0, len(reference) / sample_rate)
+        if search_hi > ref_time_j:
+            logger.debug(f"    Extending transition evidence from ref {ref_time_j:.3f}s to {search_hi:.3f}s")
+        transition_ref_time, transition_validated = _locate_transition_point(
+            reference, source, aa, sample_rate, ref_time_i, search_hi, offset_i, offset_j)
 
         delta = (offset_j - offset_i) * source_tempo
         before_foreign_time = (transition_ref_time + offset_i) * source_tempo
@@ -2318,6 +2636,10 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
             missing_ref_duration = abs(delta) / source_tempo
             replacement_start = transition_ref_time
             replacement_end = transition_ref_time + missing_ref_duration
+            if not transition_validated:
+                logger.info(f"  Skipping unsupported missing-foreign fill near ref {transition_ref_time:.3f}s: "
+                            "the local transition classifier found no two-sided evidence")
+                continue
             if (replacement_start > ref_time_i and replacement_end < search_hi
                     and before_foreign_time >= 0):
                 transition_count += 1
@@ -2329,6 +2651,7 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
                     "id": replacement_id,
                     "ref_start": replacement_start,
                     "ref_end": replacement_end,
+                    "foreign_splice_time": before_foreign_time,
                     "use_silence": use_silence,
                 })
                 refined_anchors.append((f"{replacement_id}_a_ref", f"{replacement_id}_a_foreign",
@@ -2515,6 +2838,265 @@ def measure_mean_volume_db(wav_path, start_time, end_time):
         return None
     match = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", stderr)
     return float(match.group(1)) if match else None
+
+
+def _window_rms_db(samples, sample_rate, center_time, before, window_seconds=0.15):
+    """Measure normalized analysis energy immediately before or after a splice point."""
+    center = int(round(center_time * sample_rate))
+    window = max(1, int(round(window_seconds * sample_rate)))
+    start = max(0, center - window if before else center)
+    end = min(len(samples), center if before else center + window)
+    if end <= start:
+        return None
+    rms = np.sqrt(np.mean(np.square(samples[start:end].astype(np.float64))))
+    return 20.0 * np.log10(rms + 1e-9)
+
+
+def _find_low_energy_splice(samples, sample_rate, center_time, search_seconds=1.0):
+    """Return the least-energetic splice candidate near ``center_time`` for reporting only."""
+    start_time = max(0.0, center_time - search_seconds)
+    end_time = min(len(samples) / sample_rate, center_time + search_seconds)
+    candidates = np.arange(start_time, end_time + 1e-6, 0.02)
+    scored = []
+    for candidate_time in candidates:
+        before_db = _window_rms_db(samples, sample_rate, candidate_time, before=True)
+        after_db = _window_rms_db(samples, sample_rate, candidate_time, before=False)
+        if before_db is not None and after_db is not None:
+            scored.append((max(before_db, after_db), candidate_time, before_db, after_db))
+    return min(scored, default=(None, None, None, None))
+
+
+def _find_nearby_quiet_interval(samples, sample_rate, center_time, search_seconds=3.0):
+    """Return the longest sustained quiet interval near a splice, for reporting only."""
+    aa = _import_audio_alignment()
+    intervals = aa.detect_silence_intervals(
+        samples, sample_rate, threshold_db=-35.0, min_duration=0.2)
+    nearby = [
+        interval for interval in intervals
+        if interval[1] >= center_time - search_seconds and interval[0] <= center_time + search_seconds
+    ]
+    if not nearby:
+        return None
+    return max(nearby, key=lambda interval: (interval[1] - interval[0], -abs((interval[0] + interval[1]) / 2 - center_time)))
+
+
+def _move_replacements_to_quiet_primary_splices(args, anchors, reference_wav, foreign_wav):
+    """Optionally relocate replacement ranges inside an existing reference silence.
+
+    The replacement duration and subsequent timeline shift remain unchanged. Only
+    the boundary is moved, and only when the primary source track supplies a
+    quieter pause whose corresponding reference interval stays inside the same
+    reference silence.
+    """
+    if not args.per_track_splice_placement or not AUDIO_REPLACEMENT_RANGES:
+        return anchors
+    try:
+        sample_rate, reference_audio = wavfile.read(reference_wav)
+        _, foreign_audio = wavfile.read(foreign_wav)
+    except Exception as error:
+        logger.warning(f"  Per-track splice placement skipped: {error}")
+        return anchors
+    aa = _import_audio_alignment()
+    reference_mono = reference_audio.mean(axis=1) if reference_audio.ndim == 2 else reference_audio
+    foreign_mono = foreign_audio.mean(axis=1) if foreign_audio.ndim == 2 else foreign_audio
+    reference_analysis = aa.normalize_analysis_level(reference_mono)
+    foreign_analysis = aa.normalize_analysis_level(foreign_mono)
+    reference_silences = aa.detect_silence_intervals(reference_analysis, sample_rate, threshold_db=-35.0, min_duration=0.2)
+    tempo = AUDIO_EDITORIAL_SOURCE_TEMPO if AUDIO_EDITORIAL_SOURCE_TEMPO > 0 else 1.0
+    moved = []
+    for replacement in AUDIO_REPLACEMENT_RANGES:
+        source_time = replacement.get("foreign_splice_time")
+        if source_time is None:
+            continue
+        # Remember the pre-move position so additional tracks can each search for their own
+        # quiet splice independently, instead of chaining off the primary track's choice.
+        replacement.setdefault("original_foreign_splice_time", source_time)
+        replacement.setdefault("original_ref_start", replacement["ref_start"])
+        replacement.setdefault("original_ref_end", replacement["ref_end"])
+        quiet_interval = _find_nearby_quiet_interval(foreign_analysis, sample_rate, source_time)
+        if quiet_interval is None:
+            continue
+        candidate_source = (quiet_interval[0] + quiet_interval[1]) / 2.0
+        source_delta = candidate_source - source_time
+        reference_delta = source_delta / tempo
+        candidate_start = replacement["ref_start"] + reference_delta
+        candidate_end = replacement["ref_end"] + reference_delta
+        containing_silence = next((interval for interval in reference_silences
+                                   if interval[0] <= candidate_start and candidate_end <= interval[1]), None)
+        if containing_silence is None:
+            continue
+        replacement.update({
+            "ref_start": candidate_start,
+            "ref_end": candidate_end,
+            "foreign_splice_time": candidate_source,
+        })
+        moved.append((replacement["id"], candidate_start, candidate_end, candidate_source, source_delta))
+
+    if not moved:
+        logger.info("  Per-track splice placement found no safely movable replacement ranges.")
+        return anchors
+    moved_by_id = {item[0]: item for item in moved}
+    adjusted = []
+    for ref_name, foreign_name, ref_time, foreign_time in anchors:
+        match = next((item for item in moved if ref_name.startswith(item[0])), None)
+        if match:
+            _, start, end, source_time, _ = match
+            ref_time = start if ref_name.endswith("a_ref") else end
+            foreign_time = source_time
+        adjusted.append((ref_name, foreign_name, ref_time, foreign_time))
+    adjusted.sort(key=lambda item: item[2])
+    if any(right[3] < left[3] for left, right in zip(adjusted, adjusted[1:])):
+        logger.warning("  Per-track splice placement discarded: adjusted anchors would be non-monotonic.")
+        return anchors
+    for replacement_id, start, end, source_time, source_delta in moved:
+        logger.info(f"  Per-track splice placement: {replacement_id} -> ref {start:.3f}s-{end:.3f}s, "
+                    f"source {source_time:.3f}s (shift {source_delta:+.3f}s)")
+    return adjusted
+
+
+def _localize_replacements_for_track(args, final_segment_anchors, ref_wav_analysis, track_wav_analysis, track_label):
+    """Give one additional foreign track its own quiet splice point for each relocated
+    replacement, instead of reusing the primary track's chosen boundary.
+
+    A pause that is safe in the primary language may still contain dialogue in another
+    dub, so each track searches near the replacement's original (pre-move) position for
+    its own nearby quiet interval. Only the two anchor points bracketing that replacement
+    are changed, and only in the list returned for this track; the shared
+    ``final_segment_anchors`` used by the primary track, other tracks, and subtitles is
+    left untouched.
+    """
+    if not args.per_track_splice_placement or not AUDIO_REPLACEMENT_RANGES:
+        return final_segment_anchors
+    try:
+        sample_rate, reference_audio = wavfile.read(ref_wav_analysis)
+        _, track_audio = wavfile.read(track_wav_analysis)
+    except Exception as error:
+        logger.warning(f"  Per-track splice placement skipped for {track_label}: {error}")
+        return final_segment_anchors
+    aa = _import_audio_alignment()
+    reference_mono = reference_audio.mean(axis=1) if reference_audio.ndim == 2 else reference_audio
+    track_mono = track_audio.mean(axis=1) if track_audio.ndim == 2 else track_audio
+    reference_analysis = aa.normalize_analysis_level(reference_mono)
+    track_analysis = aa.normalize_analysis_level(track_mono)
+    reference_silences = aa.detect_silence_intervals(reference_analysis, sample_rate, threshold_db=-35.0, min_duration=0.2)
+    tempo = AUDIO_EDITORIAL_SOURCE_TEMPO if AUDIO_EDITORIAL_SOURCE_TEMPO > 0 else 1.0
+
+    adjusted = list(final_segment_anchors)
+    moved_count = 0
+    for replacement in AUDIO_REPLACEMENT_RANGES:
+        base_source_time = replacement.get("original_foreign_splice_time", replacement.get("foreign_splice_time"))
+        base_ref_start = replacement.get("original_ref_start", replacement["ref_start"])
+        base_ref_end = replacement.get("original_ref_end", replacement["ref_end"])
+        if base_source_time is None:
+            continue
+        quiet_interval = _find_nearby_quiet_interval(track_analysis, sample_rate, base_source_time)
+        if quiet_interval is None:
+            continue
+        candidate_source = (quiet_interval[0] + quiet_interval[1]) / 2.0
+        source_delta = candidate_source - base_source_time
+        reference_delta = source_delta / tempo
+        candidate_start = base_ref_start + reference_delta
+        candidate_end = base_ref_end + reference_delta
+        containing_silence = next((interval for interval in reference_silences
+                                   if interval[0] <= candidate_start and candidate_end <= interval[1]), None)
+        if containing_silence is None:
+            continue
+        # Find this replacement's current boundary anchors (post primary placement) in the
+        # shared list, and nudge only those two points for this track's own copy.
+        start_idx = next((i for i, (ref_t, _) in enumerate(adjusted)
+                          if abs(ref_t - replacement["ref_start"]) < 0.001), None)
+        end_idx = next((i for i, (ref_t, _) in enumerate(adjusted)
+                        if abs(ref_t - replacement["ref_end"]) < 0.001), None)
+        if start_idx is None or end_idx is None:
+            continue
+        trial = list(adjusted)
+        trial[start_idx] = (candidate_start, candidate_source)
+        trial[end_idx] = (candidate_end, candidate_source)
+        if any(right[0] < left[0] or right[1] < left[1] for left, right in zip(trial, trial[1:])):
+            logger.debug(f"  Per-track splice placement for {track_label}: discarded {replacement['id']} (non-monotonic).")
+            continue
+        adjusted = trial
+        moved_count += 1
+        logger.info(f"  Per-track splice placement ({track_label}): {replacement['id']} -> "
+                    f"ref {candidate_start:.3f}s-{candidate_end:.3f}s, source {candidate_source:.3f}s "
+                    f"(shift {source_delta:+.3f}s from original position)")
+    if moved_count == 0:
+        logger.info(f"  Per-track splice placement found no independently movable replacement ranges for {track_label}.")
+    return adjusted
+
+
+def write_splice_safety_report(path, args, final_segment_anchors):
+    """Report whether every selected source track is quiet at planned splice edges.
+
+    Audio is loudness-normalized only for this analysis. The report never changes
+    the recipe or the delivered tracks, and supports per-track decisions later.
+    """
+    if not AUDIO_REPLACEMENT_RANGES:
+        logger.info("  No reference replacement ranges to include in splice-safety report.")
+        return
+    aa = _import_audio_alignment()
+    sample_rate = aa.DEFAULT_SAMPLE_RATE
+    rows = []
+    for track in args.selected_foreign_tracks:
+        stream_idx = track["stream_idx"]
+        try:
+            analysis_audio = aa.extract_mono_audio(
+                args.foreign_video, stream_idx, sample_rate, normalize_loudness=True)
+        except RuntimeError as error:
+            logger.warning(f"  Splice-safety analysis skipped for stream #{stream_idx}: {error}")
+            continue
+        for replacement in AUDIO_REPLACEMENT_RANGES:
+            ref_start = replacement["ref_start"]
+            ref_end = replacement["ref_end"]
+            source_splice_time = replacement.get("foreign_splice_time")
+            if source_splice_time is None:
+                nearest_anchor = min(final_segment_anchors, key=lambda anchor: abs(anchor[0] - ref_start))
+                source_splice_time = nearest_anchor[1]
+            before_db = _window_rms_db(analysis_audio, sample_rate, source_splice_time, before=True)
+            after_db = _window_rms_db(analysis_audio, sample_rate, source_splice_time, before=False)
+            edge_cost = max(value for value in (before_db, after_db) if value is not None)
+            candidate_cost, candidate_time, candidate_before_db, candidate_after_db = _find_low_energy_splice(
+                analysis_audio, sample_rate, source_splice_time)
+            quiet_interval = _find_nearby_quiet_interval(
+                analysis_audio, sample_rate, source_splice_time)
+            quiet_start, quiet_end = quiet_interval if quiet_interval else (None, None)
+            quiet_duration = quiet_end - quiet_start if quiet_interval else None
+            rows.append([
+                replacement["id"], stream_idx, track.get("language") or "und",
+                f"{ref_start:.3f}", f"{ref_end:.3f}",
+                f"{source_splice_time:.3f}",
+                f"{before_db:.1f}" if before_db is not None else "",
+                f"{after_db:.1f}" if after_db is not None else "",
+                f"{edge_cost:.1f}",
+                "quiet" if edge_cost <= -35.0 else "content-present",
+                f"{candidate_time:.3f}" if candidate_time is not None else "",
+                f"{candidate_time - source_splice_time:+.3f}" if candidate_time is not None else "",
+                f"{candidate_before_db:.1f}" if candidate_before_db is not None else "",
+                f"{candidate_after_db:.1f}" if candidate_after_db is not None else "",
+                f"{candidate_cost:.1f}" if candidate_cost is not None else "",
+                "quiet" if candidate_cost is not None and candidate_cost <= -35.0 else "content-present",
+                f"{quiet_start:.3f}" if quiet_start is not None else "",
+                f"{quiet_end:.3f}" if quiet_end is not None else "",
+                f"{quiet_duration:.3f}" if quiet_duration is not None else "",
+                "yes" if quiet_duration is not None and quiet_duration >= ref_end - ref_start else "no",
+            ])
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                "replacement_id", "stream_idx", "language", "reference_start",
+                "reference_end", "source_splice_time", "source_before_db",
+                "source_after_db", "edge_cost_db", "assessment",
+                "best_source_splice_time", "best_offset_seconds",
+                "best_before_db", "best_after_db", "best_edge_cost_db",
+                "best_assessment",
+                "nearby_quiet_start", "nearby_quiet_end", "nearby_quiet_duration",
+                "quiet_interval_covers_replacement",
+            ])
+            writer.writerows(rows)
+        logger.info(f"  -> Wrote {len(rows)} per-track splice-safety measurements to {path}")
+    except OSError as error:
+        logger.warning(f"  Failed to write splice-safety report: {error}")
 
 
 def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, ref_duration, segment_num, temp_dir, max_iterations=3, target_precision_ms=5, is_first_segment=False, is_last_segment=False, first_adjust_ms=0.0, last_adjust_ms=0.0, gain_db=0.0):
@@ -2889,6 +3471,8 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         return None, None
 
     # --- Step 3: Detect Audio Boundaries ---
+    visual_anchors_details = _move_replacements_to_quiet_primary_splices(
+        args, visual_anchors_details, ref_wav_analysis, foreign_wav_analysis)
     logger.info(f"--- Detecting Audio Content Boundaries (Threshold: {db_threshold} dB) ---")
     ref_start_s, ref_end_s = find_audio_start_end(ref_wav_analysis, db_threshold)
     foreign_start_s, foreign_end_s = find_audio_start_end(foreign_wav_analysis, db_threshold)
@@ -3039,6 +3623,9 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     if num_segments <= 0:
         logger.error("-> Need at least 2 final anchors (start and end) to define segments. Cannot proceed.")
         return None, None
+
+    if args.splice_safety_report_csv:
+        write_splice_safety_report(args.splice_safety_report_csv, args, final_segment_anchors)
 
     # --- Step 5: Write Segment Info to CSV (Optional) ---
     if args.output_csv: # Check if CSV output is requested
@@ -4324,6 +4911,11 @@ Workflow:
     parser.add_argument("output_video", help="Path for the final muxed video file including reference video, reference audio, and synced foreign audio.")
     parser.add_argument("--output_audio", metavar="WAV_PATH", default=None, help="Optional: Path to save the synchronized audio as WAV file. If not specified, a temporary file will be used and deleted after muxing.")
     parser.add_argument("--output_csv", metavar="CSV_PATH", default=None, help="Optional: Path to save segment timing information in a CSV file. By default, no CSV is generated.")
+    parser.add_argument("--splice_safety_report_csv", metavar="CSV_PATH", default=None,
+        help="Optional: Write normalized per-track energy at every planned splice edge. Analysis only; does not change cuts or audio output.")
+    parser.add_argument("--no_per_track_splice_placement", dest="per_track_splice_placement",
+        action="store_false", default=True,
+        help="Disable automatic primary-track splice placement inside verified reference silences.")
     parser.add_argument("--no_subtitles", action='store_true', help="Skip subtitle synchronization (enabled by default)")
 
     parser.add_argument("--qc_output_dir", metavar="QC_DIR", default=None, help="Optional: Directory to save side-by-side QC images. By default, no QC images are generated.")
@@ -4368,6 +4960,10 @@ Workflow:
         help="Write a CSV dump of every audio-anchor correlation window scanned (accepted or not, "
              "with confidence/offset) plus the final anchor list actually used, for manual inspection "
              "of anchor density and confidence in a specific episode. Only applies to --anchor_source audio.")
+    anchor_group.add_argument("--transition_report_csv", default=None, metavar="PATH",
+        help="Write one-second local waveform/envelope/energy measurements around every material "
+             "audio-offset transition, before any automatic cut or fill is applied. Only applies to "
+             "--anchor_source audio.")
 
     # --- Audio Processing Arguments ---
     audio_group = parser.add_argument_group('Audio Processing Parameters')
@@ -4667,6 +5263,7 @@ Workflow:
                     search_radius_seconds=args.audio_anchor_search_radius,
                     jump_tolerance_seconds=args.audio_jump_tolerance,
                     anchor_report_csv=args.anchor_report_csv,
+                    transition_report_csv=args.transition_report_csv,
                 )
                 if visual_anchors_details is None:
                     raise RuntimeError("Audio Anchor Pairing Stage Failed: No audio anchors generated.")
@@ -4779,6 +5376,7 @@ Workflow:
             logger.info(f"\n===== Syncing {len(additional_tracks)} Additional Foreign Audio Track(s) =====")
             for track in additional_tracks:
                 synced_wav = sync_additional_track(
+                    args=args,
                     foreign_video=args.foreign_video,
                     stream_idx=track['stream_idx'],
                     final_segment_anchors=final_segment_anchors,

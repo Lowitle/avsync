@@ -1,6 +1,162 @@
 OBJETIVOS_INMEDIATOS
 
+## OBJETIVO INMEDIATO_29/08/2026 - Densidad y fiabilidad de anclajes de audio
+
+Meta: lograr una cadena de anclajes verificables y continua, especialmente en
+tramos finales con musica donde no hay silencios. La prioridad es calidad y
+trazabilidad, no velocidad de proceso.
+
+1. Validar la representacion de ganancia lineal como respaldo de `loudnorm`.
+    - `loudnorm` sigue siendo la ruta principal.
+    - Solo las ventanas rechazadas se reintentan con ganancia lineal, sin
+       compresion ni limitador.
+    - Revisar `--anchor_report_csv` y aceptar la ruta solo si recupera anclas
+       plausibles sin alterar las anclas limpias existentes.
+    - Estado: IMPLEMENTADO Y VALIDADO TECNICAMENTE. Recupera anclas en E02
+      (120s, 570s y 600s), pero el resultado auditivo en el tramo final sigue
+      siendo similar a las versiones anteriores: aparece un corte que no
+      soluciona el descuadre y puede caer en medio de voz. Mantener como
+      señal complementaria; no considerarlo solucion al problema final.
+
+2. Anadir un barrido denso adaptativo para huecos problematicos.
+    - Ventana de 10 segundos y paso de 5 segundos.
+    - Ejecutarlo solo en huecos entre anclas o en la cola que superen el limite
+       configurado; no en todo el episodio.
+    - Exigir continuidad de offset con anclas vecinas, no aceptar picos aislados.
+      - Estado: IMPLEMENTADO Y VALIDADO A OIDO EN S01E02. Corrige el tramo final
+         que antes quedaba desincronizado. Mantener esta estrategia.
+
+2.1. Verificar las transiciones donde cambia bruscamente el offset.
+      - Caso actual S01E02: entre ref 10:00 y 10:30 el offset cambia de -4.61s a
+         -6.20s. El localizador lo situa en ref 10:15.000-10:16.596 y crea un
+         relleno de silencio de 1.596s; el usuario percibe el problema a partir de
+         ~10:30.
+      - El problema no lo genera `compare_silence_profiles` ni su umbral -40 dBFS:
+         el relleno actual nace de la diferencia entre dos anclas de correlacion.
+         Por ello la calibracion del punto 3 no debe decidir aun esta transicion.
+      - Paso 1: crear un verificador local integrado para ref 10:00-10:30 que use
+         los arrays completos ya extraidos por AVSync, no seeks cortos sobre AC3.
+      - Paso 2: medir cada 1-2 segundos offset, confianza waveform, confianza
+         envelope y energia local, y exportar el resultado para revision.
+      - Paso 3: clasificar la evidencia como salto real y estable, transicion
+         gradual, falso pico inducido por musica/voz o material realmente ausente.
+      - Paso 4: solo crear corte/relleno si varias medidas consecutivas describen
+         el mismo salto de forma monotona y consistente; si no, conservar el
+         segmento sin introducir un corte automatico.
+      - Paso 5: despues de validar este caso, aplicar el punto 3 para mejorar la
+         deteccion de silencios reales y la decision de si un empalme es seguro,
+         pero sin mezclarlo con la clasificacion de este salto.
+         - Evidencia inicial (`S01E02_transitions.csv`): de ref 10:04 a 10:15,
+            waveform y envelope sostienen aproximadamente -4.61s. En ref 10:16 hay
+            una pausa real (-39.7 dB), pero las medidas siguientes son ambiguas; en
+            10:25-10:26 ambos metodos vuelven a -4.61s. Por tanto no hay evidencia
+            continua de que el salto a -6.20s ocurra en 10:15. El corte actual en
+            10:15 debe considerarse no validado. Ampliar el informe hasta 10:30 para
+            localizar si el cambio real aparece justo antes/despues del ancla larga.
+         - Observacion auditiva posterior: tras el corte/silencio de ~10:15, el audio
+            vuelve a sincronizar aproximadamente en 10:50. La receta actual explica ese
+            patron: fuerza el relleno en 10:15 y despues estira el segmento completo
+            ref 10:30-11:00 hacia el nuevo offset. Esto no confirma que el corte ocurra
+            en 10:15; refuerza que el cambio debe localizarse dentro del tramo posterior
+            antes de crear cualquier relleno.
+         - Evidencia ampliada: el estado previo (-4.61s) se confirma hasta 10:15;
+            entre 10:16 y 10:34 la energia es baja o las medidas son ambiguas; desde
+            10:35 hasta al menos 10:58 el offset posterior (-6.19s) es continuo y
+            respaldado por waveform/envelope. Hay por tanto una transicion real, pero
+            no en 10:15: ocurre dentro de la banda ambigua 10:16-10:35.
+         - Regla candidata general: cuando haya dos estados de offset estables
+            separados por una banda ambigua, situar el corte en el punto de menor
+            energia dentro de esa banda y no en el punto medio de una busqueda binaria.
+            En E02 el minimo de referencia observado esta cerca de 10:33 (-73 dB),
+            justo antes de que aparezca el estado posterior fiable. Validar esta regla
+            en salida separada antes de activarla como receta automatica.
+         - Resultado del comparador de hipotesis fijadas: entre 10:10 y 10:30 la
+            envolvente favorece de forma muy fuerte el offset anterior (-4.61s;
+            similitud 0.78-0.99), mientras que el offset posterior no queda
+            confirmado. Por tanto el corte en 10:15 es incorrecto y tampoco se puede
+            afirmar que el salto sea exactamente en 10:30. Una ancla gruesa de 60s
+            demuestra correspondencia de su ventana completa (10:30-11:30), no que
+            el nuevo estado empiece justo en su timestamp. El siguiente analisis debe
+            extender las hipotesis locales mas alla del borde del ancla para localizar
+            el primer tramo posterior estable antes de decidir una receta.
+         - Resultado de rechazar el relleno sin cambiar las anclas: confirma que el
+            silencio de 1.596s ya no se inserta, pero el desfase se redistribuye en el
+            segmento ref 09:30-10:30 (60.000s de destino, 56.002s de source) con
+            `atempo=0.93337`, frente al factor global esperado ~0.95904. Por ello se
+            percibe una desincronizacion: rechazar el corte no elimina el error de
+            timing entre las anclas, solo lo reparte como ralentizacion/aceleracion.
+         - Siguiente paso: antes de elegir entre relleno o estiramiento, clasificar
+            de forma general si la diferencia entre anclas representa material
+            realmente ausente o una estimacion local incorrecta del offset. La receta
+            no debe crear relleno ni aplicar un estiramiento grande hasta distinguir
+            esos dos casos con evidencia adicional.
+         - Resultado de la receta con evidencia unificada (`E02_unified_transition_evidence`):
+            se formo una racha anterior hasta ~10:25 y una racha posterior estable
+            desde ~10:36. El relleno se desplazo de ref 10:15.000-10:16.596 a
+            ref 10:35.450-10:37.046, dentro de la banda ambigua y cerca de la pausa
+            real. El sistema eligio audio de referencia para rellenar, ya que ambos
+            puntos de empalme pasaron el chequeo de pausa natural. Pendiente de
+            revision auditiva focalizada entre 10:20 y 10:50 antes de considerarlo
+            validado.
+         - Estado final: VALIDADO A OIDO. `E02_unified_transition_evidence.mkv`
+            queda totalmente sincronizado. La receta unificada se conserva como
+            solucion general: una sola evidencia de rachas anterior/posterior decide
+            tanto el punto de corte como la autorizacion del relleno.
+         - Consolidacion pendiente: ejecutar una regresion aislada sobre S01E01,
+            que ya era correcto, antes de crear el siguiente checkpoint local.
+
+2.2. Analisis por pista de puntos de empalme.
+         - Estado: VALIDADO A OIDO EN S01E01 y promovido para la pista primary.
+            `--splice_safety_report_csv` analiza cada pista foreign sobre una copia
+            normalizada y mide energia antes/despues del empalme real.
+         - El informe busca tambien el punto de menor energia en una ventana de
+            +/-1s y registra el desplazamiento propuesto y su coste, por pista.
+         - Evidencia S01E01, reemplazo ~01:20: el punto actual (source 75.696s)
+            tiene contenido (-22.7/-18.2 dB), pero el candidato source 76.696s
+            (+1.000s) es quiet (-66.3/-66.0 dB). Esto demuestra que cada doblaje
+            puede necesitar su propio borde aunque comparta la misma receta temporal.
+         - Resultado: `E01_per_track_splice.mkv` desplaza el reemplazo ~01:20 de
+            source 75.696s a 76.640s, donde la pista española tiene pausa limpia,
+            preservando la duración final (error 0.003s). Revision auditiva:
+            natural y perfecta.
+         - El comportamiento queda activado por defecto solo para la pista primary;
+            `--no_per_track_splice_placement` permite desactivarlo.
+         - Extendido a pistas adicionales: `_localize_replacements_for_track` busca,
+            para cada pista foreign extra, su propio hueco silencioso cercano a la
+            posicion original (pre-movimiento) del reemplazo, en vez de reutilizar
+            el borde ya elegido para la pista primary. Solo se ajustan las dos anclas
+            que delimitan ese reemplazo, y solo en la copia de anclas de esa pista;
+            la lista compartida (`final_segment_anchors`) usada por la pista
+            primary, otras pistas y los subtitulos no se toca.
+         - Limite conocido: esta localizacion por pista solo aplica a la ruta de
+            `AUDIO_REPLACEMENT_RANGES` (huecos de contenido faltante, caso E01). No
+            aplica cuando existe una receta editorial de transiciones
+            (`AUDIO_EDITORIAL_EDITS`, caso E02); ahi las pistas adicionales siguen
+            la receta unificada sin busqueda de borde propio.
+         - Pendiente: validar a oido con una segunda pista foreign real (no solo
+            compilacion) antes del proximo checkpoint.
+
+3. Calibrar umbrales por episodio a partir de anclas limpias.
+    - Estimar suelo de ruido y rango dinamico de cada pista en tramos confirmados.
+    - Derivar el umbral de silencio en vez de fijar siempre -40 dBFS.
+    - Mantener los valores calculados en el log/CSV para revision.
+
+4. Validacion obligatoria por iteracion.
+    - Probar primero en S01E02 y comparar anclas/receta contra el checkpoint
+       `59eb2c4`.
+    - Revisar a oido el tramo ~19:30 hasta el final antes de aplicar el cambio a
+       otro episodio.
+    - No volver a ejecutar el batch completo hasta que esta zona sea estable.
+      - Estado de E02: final corregido por el punto 2; pendiente de validar la
+         transicion de 10:15 y revisar a oido desde ~10:30.
+
+## HISTORICO - OBJETIVOS ANTERIORES IMPLEMENTADOS
+
+Estos puntos describen el modelo que ya se incorporo al fork. Se mantienen como
+referencia de diseno; no son tareas pendientes inmediatas.
+
 1. **Separar las pistas de comparación de las pistas que se conservan**
+   - Audio original HQ/LQ para detectar diferencias.
    - Audio original HQ/LQ para detectar diferencias.
    - Audios extranjeros LQ para corregir.
    - Subtítulos LQ para corregir.

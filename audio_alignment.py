@@ -131,7 +131,12 @@ def _normalize(values):
 
 
 def normalize_analysis_level(values, target_peak=0.9):
-    """Scale a signal for level-independent silence analysis only."""
+    """Scale a signal by one constant gain for level-independent analysis.
+
+    Unlike FFmpeg ``loudnorm``, this does not compress or limit the signal:
+    every sample is multiplied by one fixed factor, preserving its waveform
+    and internal dynamics.
+    """
     values = np.asarray(values, dtype=np.float64)
     if values.size == 0:
         return values.copy()

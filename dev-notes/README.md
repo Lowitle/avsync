@@ -30,3 +30,9 @@ machines, new chat sessions, etc.).
   checkpoint-cache bug, offset-consistency relaxed acceptance, interior gap
   densification, anchor diagnostic CSV) found while batch-processing a real
   season.
+- [2026-08-29 — Session 03](2026-08-29-session-03.md): E02 transition
+  investigation, linear-gain fallback, dense scan validated for the tail,
+  integrated transition diagnostics, and current state-classifier experiment.
+- [2026-08-30 — Session 04](2026-08-30-session-04.md): E01 regression,
+  per-track splice-safety analysis, and validated primary-track quiet-splice
+  placement promoted to the default behavior.
