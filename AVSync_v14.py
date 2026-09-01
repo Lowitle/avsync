@@ -267,7 +267,7 @@ def get_cache_path(args):
 def save_checkpoint(cache_path, visual_anchors_details):
     """Save checkpoint data to disk"""
     checkpoint_data = {
-        'version': 15,
+        'version': 16,
         'visual_anchors_details': visual_anchors_details,
         # Anchor pairing also derives this global state (gap-fill ranges, silence-based
         # editorial edits); it must travel with the anchors or segment processing breaks
@@ -2679,6 +2679,19 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
         after_foreign_time = (after_ref_time + offset_j) * source_tempo
         if after_foreign_time <= before_foreign_time or before_foreign_time < 0:
             logger.debug(f"    Skipping transition refinement near ref {transition_ref_time:.3f}s: non-monotonic foreign times")
+            continue
+
+        previous_foreign_time = max(
+            (anchor[3] for anchor in refined_anchors if anchor[2] <= before_ref_time),
+            default=float("-inf"),
+        )
+        next_foreign_time = min(
+            (anchor[3] for anchor in refined_anchors if anchor[2] >= after_ref_time),
+            default=float("inf"),
+        )
+        if before_foreign_time < previous_foreign_time or after_foreign_time > next_foreign_time:
+            logger.debug(f"    Skipping transition refinement near ref {transition_ref_time:.3f}s: "
+                         "would reverse time relative to neighboring anchors")
             continue
 
         transition_count += 1
