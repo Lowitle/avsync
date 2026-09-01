@@ -224,6 +224,21 @@ trazabilidad, no velocidad de proceso.
          `S01_batch_output` (no reutiliza `S01_sincronizada`, que ya tiene
          experimentos con nombres manuales). Pendiente: revisar los 22 logs y
          escuchar puntos de reemplazo/transicion tras completar.
+      - Resultado del batch (01/09): 10/22 episodios terminaron correctamente;
+         11 fallaron por un rango source de longitud cero en un reemplazo
+         (`foreign_start == foreign_end`) y E14 genero salida pero con +2.224s
+         de desviacion, asi que no se considera valido. Causa de los 11 fallos:
+         `_move_replacements_to_quiet_primary_splices` mutaba
+         `AUDIO_REPLACEMENT_RANGES` antes de comprobar que las nuevas anclas
+         fueran monotonicas. Al rechazar la propuesta conservaba anclas viejas
+         pero metadatos nuevos, por lo que el reemplazo ya no se identificaba y
+         llegaba al renderizador generico como un rango source nulo.
+      - Fix: la reubicacion primary es ahora transaccional; primero construye
+         anclas candidatas, comprueba monotonía y solo entonces actualiza los
+         metadatos de reemplazo. `test_per_track_splice_localization.py` cubre
+         explicitamente el rechazo y prueba que los tres bordes activos no se
+         modifican. Pendiente: relanzar de forma aislada E03/E04/E05/E06/E07,
+         E10/E13/E17/E18/E19/E21 con cache, y analizar E14 por separado.
       - Pendiente: aun no se ha ejecutado el batch completo de la temporada; seguir
          validando episodio a episodio antes de ese paso.
 

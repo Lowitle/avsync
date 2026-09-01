@@ -90,6 +90,30 @@ def main():
 
         print("OK: additional track picked its own quiet splice point, independent of the primary track's.")
 
+        # A rejected primary move must not mutate replacement metadata. Otherwise
+        # the old anchors and newly moved metadata no longer match, and the generic
+        # renderer receives a zero-length source range.
+        av.AUDIO_REPLACEMENT_RANGES[:] = [{
+            "id": "AUDIO_REPLACEMENT_0002",
+            "ref_start": 10.5,
+            "ref_end": 11.0,
+            "foreign_splice_time": 10.7,
+            "use_silence": False,
+        }]
+        original = dict(av.AUDIO_REPLACEMENT_RANGES[0])
+        rejected_anchors = [
+            ("START_ref", "START_foreign", 0.0, 0.0),
+            ("AUDIO_REPLACEMENT_0002_a_ref", "AUDIO_REPLACEMENT_0002_a_foreign", 10.5, 10.7),
+            ("AUDIO_REPLACEMENT_0002_b_ref", "AUDIO_REPLACEMENT_0002_b_foreign", 11.0, 10.7),
+            ("NEXT_ref", "NEXT_foreign", 11.1, 8.5),
+        ]
+        rejected = av._move_replacements_to_quiet_primary_splices(
+            Args(), rejected_anchors, ref_path, track_path)
+        assert rejected == rejected_anchors
+        for field in ("ref_start", "ref_end", "foreign_splice_time"):
+            assert av.AUDIO_REPLACEMENT_RANGES[0][field] == original[field]
+        print("OK: a rejected primary placement preserves its original replacement metadata.")
+
 
 if __name__ == "__main__":
     main()

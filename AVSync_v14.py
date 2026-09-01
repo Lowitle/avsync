@@ -2961,17 +2961,11 @@ def _move_replacements_to_quiet_primary_splices(args, anchors, reference_wav, fo
                                    if interval[0] <= candidate_start and candidate_end <= interval[1]), None)
         if containing_silence is None:
             continue
-        replacement.update({
-            "ref_start": candidate_start,
-            "ref_end": candidate_end,
-            "foreign_splice_time": candidate_source,
-        })
         moved.append((replacement["id"], candidate_start, candidate_end, candidate_source, source_delta))
 
     if not moved:
         logger.info("  Per-track splice placement found no safely movable replacement ranges.")
         return anchors
-    moved_by_id = {item[0]: item for item in moved}
     adjusted = []
     for ref_name, foreign_name, ref_time, foreign_time in anchors:
         match = next((item for item in moved if ref_name.startswith(item[0])), None)
@@ -2985,6 +2979,12 @@ def _move_replacements_to_quiet_primary_splices(args, anchors, reference_wav, fo
         logger.warning("  Per-track splice placement discarded: adjusted anchors would be non-monotonic.")
         return anchors
     for replacement_id, start, end, source_time, source_delta in moved:
+        replacement = next(item for item in AUDIO_REPLACEMENT_RANGES if item["id"] == replacement_id)
+        replacement.update({
+            "ref_start": start,
+            "ref_end": end,
+            "foreign_splice_time": source_time,
+        })
         logger.info(f"  Per-track splice placement: {replacement_id} -> ref {start:.3f}s-{end:.3f}s, "
                     f"source {source_time:.3f}s (shift {source_delta:+.3f}s)")
     return adjusted
