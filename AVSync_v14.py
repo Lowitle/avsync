@@ -267,12 +267,13 @@ def get_cache_path(args):
 def save_checkpoint(cache_path, visual_anchors_details):
     """Save checkpoint data to disk"""
     checkpoint_data = {
-        'version': 16,
+        'version': 17,
         'visual_anchors_details': visual_anchors_details,
         # Anchor pairing also derives this global state (gap-fill ranges, silence-based
         # editorial edits); it must travel with the anchors or segment processing breaks
         # when a cache hit skips run_audio_pairing_stage() entirely.
         'audio_replacement_ranges': AUDIO_REPLACEMENT_RANGES,
+        'audio_hard_cut_ranges': AUDIO_HARD_CUT_RANGES,
         'audio_editorial_edits': AUDIO_EDITORIAL_EDITS,
         'audio_editorial_source_tempo': AUDIO_EDITORIAL_SOURCE_TEMPO,
         'timestamp': time.time()
@@ -476,6 +477,7 @@ MKVMERGE_EXEC = None
 MATCH_WINDOW_PERCENT = 0.06 # Percentage of ref video duration for INITIAL anchor search window
 ANCHOR_FOLLOW_FORWARD_WINDOW_S = 10.0 # Seconds forward from estimated position for subsequent matches
 AUDIO_REPLACEMENT_RANGES = [] # Reference intervals to fill from the reference audio when foreign content is missing
+AUDIO_HARD_CUT_RANGES = [] # Near-instant reference ranges that delete extra source timeline material
 AUDIO_EDITORIAL_EDITS = [] # Explicit source-timeline edits shared with subtitle retiming
 AUDIO_EDITORIAL_SOURCE_TEMPO = 1.0
 THRESHOLD_CALIBRATION_LOG = [] # (label, noise_floor_db, threshold_db) rows for --threshold_calibration_csv
@@ -2103,6 +2105,7 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
     aa = _import_audio_alignment()
     sample_rate = aa.DEFAULT_SAMPLE_RATE
     AUDIO_REPLACEMENT_RANGES.clear()
+    AUDIO_HARD_CUT_RANGES.clear()
     AUDIO_EDITORIAL_EDITS.clear()
 
     logger.info("\n===== Audio Anchor Pairing Stage =====")
@@ -2695,9 +2698,17 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
             continue
 
         transition_count += 1
-        refined_anchors.append((f"AUDIO_TRANSITION_{transition_count:04d}a_ref", f"AUDIO_TRANSITION_{transition_count:04d}a_foreign",
+        transition_id = f"AUDIO_TRANSITION_{transition_count:04d}"
+        AUDIO_HARD_CUT_RANGES.append({
+            "id": transition_id,
+            "ref_start": before_ref_time,
+            "ref_end": after_ref_time,
+            "foreign_start": before_foreign_time,
+            "foreign_end": after_foreign_time,
+        })
+        refined_anchors.append((f"{transition_id}a_ref", f"{transition_id}a_foreign",
                                  before_ref_time, before_foreign_time))
-        refined_anchors.append((f"AUDIO_TRANSITION_{transition_count:04d}b_ref", f"AUDIO_TRANSITION_{transition_count:04d}b_foreign",
+        refined_anchors.append((f"{transition_id}b_ref", f"{transition_id}b_foreign",
                                  after_ref_time, after_foreign_time))
         logger.info(f"  Located precise transition at ref {transition_ref_time:.3f}s (jump {delta:+.3f}s) -> "
                     f"hard-cut anchors at {before_ref_time:.3f}s/{after_ref_time:.3f}s instead of stretching the "
@@ -3799,15 +3810,26 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
              and abs(item["ref_end"] - ref_end) < 0.001),
             None,
         )
+        hard_cut_range = next(
+            (item for item in AUDIO_HARD_CUT_RANGES
+             if abs(item["ref_start"] - ref_start) < 0.001
+             and abs(item["ref_end"] - ref_end) < 0.001),
+            None,
+        )
         segment_source_wav = foreign_wav_full
         segment_source_start = foreign_start
         segment_source_end = foreign_end
-        if replacement_range is not None and replacement_range.get("use_silence"):
+        if hard_cut_range is not None or (replacement_range is not None and replacement_range.get("use_silence")):
             # Copying reference audio here would hard-cut mid-note/mid-phrase content,
             # which sounds worse than a silent gap of the same duration.
-            logger.info(f"  -> Segment {segment_num}: Filling missing foreign content "
-                        f"({ref_start:.3f}s-{ref_end:.3f}s) with silence "
-                        f"(reference audio here is not a natural cut point)")
+            if hard_cut_range is not None:
+                logger.info(f"  -> Segment {segment_num}: Applying editorial hard cut "
+                            f"({foreign_start:.3f}s-{foreign_end:.3f}s source removed; "
+                            f"{target_ref_duration:.3f}s neutral transition)")
+            else:
+                logger.info(f"  -> Segment {segment_num}: Filling missing foreign content "
+                            f"({ref_start:.3f}s-{ref_end:.3f}s) with silence "
+                            f"(reference audio here is not a natural cut point)")
             silence_path = os.path.join(temp_dir, f"segment_{segment_num:04d}_silence.wav")
             silence_cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
@@ -5331,6 +5353,7 @@ Workflow:
                 visual_anchors_details = checkpoint.get('visual_anchors_details')
                 if visual_anchors_details:
                     AUDIO_REPLACEMENT_RANGES[:] = checkpoint.get('audio_replacement_ranges') or []
+                    AUDIO_HARD_CUT_RANGES[:] = checkpoint.get('audio_hard_cut_ranges') or []
                     AUDIO_EDITORIAL_EDITS[:] = checkpoint.get('audio_editorial_edits') or []
                     AUDIO_EDITORIAL_SOURCE_TEMPO = checkpoint.get('audio_editorial_source_tempo', 1.0)
                     logger.info("[CACHE] Using cached anchors, skipping frame/audio anchor detection")

@@ -239,6 +239,26 @@ trazabilidad, no velocidad de proceso.
          explicitamente el rechazo y prueba que los tres bordes activos no se
          modifican. Pendiente: relanzar de forma aislada E03/E04/E05/E06/E07,
          E10/E13/E17/E18/E19/E21 con cache, y analizar E14 por separado.
+      - Relanzamiento (01/09): el fix transaccional resolvio E03/E04/E05/E07,
+         E10/E13/E17/E18/E19/E21. E06 aun revelo otra ancla de transicion
+         invalida: aunque su pareja era internamente creciente, retrocedia
+         respecto al ancla anterior. Se agrego validacion contra las anclas
+         vecinas y cache v16; E06 vuelve a completar, descartando la transicion
+         cerca de ref 1133.100s que invertiría el source timeline.
+      - E14: la anomalia de +2.224s era un salto positivo que comprimía 2.312s
+         source en una ventana reference de 100ms (`atempo=23.1x`), fallo de
+         FFmpeg seguido de fallback sin adaptar. La herramienta ahora registra
+         esos saltos como `AUDIO_HARD_CUT_RANGES` (cache v17) y renderiza la
+         microventana como transicion neutra mientras elimina el intervalo
+         source extra. `E14_hard_cut_check.mkv` valida la ruta: no hay
+         `atempo=23x`, log confirma eliminar source 1109.781s-1112.093s, y la
+         duracion final queda a +0.012s. Layout de salida conservado (HEVC,
+         eng EAC3 5.1, spa MP3 stereo).
+      - Estado actual: los 22 episodios ya tienen una salida tecnicamente
+         completa o un check aislado valido. Pendiente: sustituir E06/E14 en
+         la carpeta final con sus checks validados y escuchar de forma
+         focalizada los cortes/reemplazos editoriales antes de declarar S01
+         validada a oido.
       - Pendiente: aun no se ha ejecutado el batch completo de la temporada; seguir
          validando episodio a episodio antes de ese paso.
 
