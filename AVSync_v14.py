@@ -1224,6 +1224,37 @@ def get_file_duration(file_path, media_type='audio'):
         logger.error(f"Error getting duration for {os.path.basename(file_path)}: {e}", exc_info=False)
         return None
 
+
+def find_visual_program_bounds(video_path, minimum_black_seconds=0.2):
+    """Return the first and last non-black video timestamps, when detectable.
+
+    This deliberately does not assume that audio silence matches video black:
+    dubbed releases can announce the episode title while the picture is still
+    black. ``None`` is returned for either boundary when the video has no
+    qualifying black lead-in/trailer, so callers can safely retain audio bounds.
+    """
+    duration = get_file_duration(video_path, media_type='video')
+    if duration is None:
+        return None, None
+    try:
+        command = [
+            FFMPEG_EXEC, "-hide_banner", "-v", "info", "-i", video_path,
+            "-vf", f"blackdetect=d={minimum_black_seconds}:pix_th=0.10",
+            "-an", "-f", "null", "-",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=120)
+    except Exception as error:
+        logger.warning(f"  Visual program-boundary detection skipped for {os.path.basename(video_path)}: {error}")
+        return None, None
+
+    black_ranges = [
+        (float(match.group(1)), float(match.group(2)))
+        for match in re.finditer(r"black_start:([0-9.]+)\s+black_end:([0-9.]+)", result.stderr)
+    ]
+    visual_start = next((end for start, end in black_ranges if start <= 0.1), None)
+    visual_end = next((start for start, end in reversed(black_ranges) if end >= duration - 0.1), None)
+    return visual_start, visual_end
+
 # --- Image Pairing Stage Functions ---
 def extract_frames_ffmpeg(video_path, output_folder, scene_threshold):
     """Extracts scene change frames using FFmpeg's scene detection."""
@@ -3173,7 +3204,7 @@ def write_splice_safety_report(path, args, final_segment_anchors):
         logger.warning(f"  Failed to write splice-safety report: {error}")
 
 
-def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, ref_duration, segment_num, temp_dir, max_iterations=3, target_precision_ms=5, is_first_segment=False, is_last_segment=False, first_adjust_ms=0.0, last_adjust_ms=0.0, gain_db=0.0):
+def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, ref_duration, segment_num, temp_dir, max_iterations=3, target_precision_ms=5, is_first_segment=False, is_last_segment=False, first_adjust_ms=0.0, last_adjust_ms=0.0, gain_db=0.0, fixed_speed=None):
     """
     Processes an audio segment, iteratively adjusting 'atempo' to match a target duration precisely.
 
@@ -3243,7 +3274,7 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
     # Initial speed factor estimate
     # IMPORTANT: `atempo` filter works inversely: tempo < 1 slows down, tempo > 1 speeds up.
     # So, we need foreign_duration / ref_duration
-    initial_speed_factor = foreign_duration / ref_duration
+    initial_speed_factor = fixed_speed if fixed_speed is not None else foreign_duration / ref_duration
     clamped_speed = max(MIN_ATEMPO, min(MAX_ATEMPO, initial_speed_factor))
 
     segment_output_path = os.path.join(temp_dir, f"segment_{segment_num:04d}_final.wav")
@@ -3319,6 +3350,10 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
             best_duration_diff = abs_duration_diff
             best_segment_path = iteration_path
 
+        if fixed_speed is not None:
+            logger.info(f"   Segment {segment_num}: Preserved fixed FPS tempo {clamped_speed:.6f}x.")
+            break
+
         # Check if we've reached the target precision
         if abs_duration_diff <= target_precision_s:
             logger.info(f"   Segment {segment_num}: Achieved target precision ({abs_duration_diff*1000:.1f}ms <= {target_precision_ms}ms) on iteration {iteration+1}")
@@ -3348,6 +3383,14 @@ def process_segment_iteratively(foreign_wav_full, foreign_start, foreign_end, re
     if final_processed_duration is None:
         logger.error(f" Segment {segment_num}: Could not get duration of best segment '{os.path.basename(best_segment_path)}'.")
         return None
+
+    if fixed_speed is not None:
+        try:
+            shutil.copy2(best_segment_path, segment_output_path)
+            return segment_output_path
+        except Exception as error:
+            logger.error(f" Segment {segment_num}: Failed to preserve fixed-tempo segment: {error}")
+            return None
 
     final_duration_gap = ref_duration - final_processed_duration
 
@@ -3577,13 +3620,37 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     ref_start_s, ref_end_s = find_audio_start_end(ref_wav_analysis, ref_boundary_threshold)
     foreign_start_s, foreign_end_s = find_audio_start_end(foreign_wav_analysis, foreign_boundary_threshold)
 
-
     if ref_start_s is None or foreign_start_s is None:
         logger.error("-> Failed to detect audio boundaries. Cannot proceed.")
         return None, None
 
-    ref_delay_s = ref_start_s # The initial silence in the reference audio determines the final output delay
-    ref_content_duration = ref_end_s - ref_start_s
+    visual_prefix = None
+    if args.visual_program_bounds:
+        ref_visual_start, _ = find_visual_program_bounds(args.ref_video)
+        foreign_visual_start, _ = find_visual_program_bounds(args.foreign_video)
+        source_tempo = AUDIO_EDITORIAL_SOURCE_TEMPO if AUDIO_EDITORIAL_SOURCE_TEMPO > 0 else 1.0
+        if (ref_visual_start is not None and foreign_visual_start is not None
+                and ref_visual_start > 0 and foreign_visual_start > 0):
+            prefix_duration = foreign_visual_start / source_tempo
+            padding_duration = ref_visual_start - prefix_duration
+            if padding_duration >= 0:
+                visual_prefix = {
+                    "ref_start": ref_visual_start,
+                    "foreign_end": foreign_visual_start,
+                    "source_tempo": source_tempo,
+                    "padding_duration": padding_duration,
+                }
+                logger.info(f"  Visual program start: reference {ref_visual_start:.3f}s, "
+                            f"foreign {foreign_visual_start:.3f}s -> preserving foreign preamble "
+                            f"at {source_tempo:.6f}x plus {padding_duration:.3f}s padding")
+            else:
+                logger.warning(f"  Visual program start ignored: foreign preamble at FPS tempo "
+                               f"({prefix_duration:.3f}s) exceeds reference black lead-in ({ref_visual_start:.3f}s).")
+        else:
+            logger.warning("  Visual program start not found in both videos; using audio boundaries.")
+
+    ref_delay_s = 0.0 if visual_prefix else ref_start_s
+    ref_content_duration = ref_end_s if visual_prefix else ref_end_s - ref_start_s
     foreign_content_duration = foreign_end_s - foreign_start_s
 
     logger.info(f"  -> Reference Audio Content: {format_time(ref_start_s)} -> {format_time(ref_end_s)} (Duration: {ref_content_duration:.3f}s)")
@@ -3593,7 +3660,8 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     # --- Step 4: Combine and Filter Anchor Points ---
     logger.info(f"--- Filtering Anchor Points (Min Ref Segment Duration: {min_segment_duration}s, Max Duration Diff: {MAX_ALLOWED_DURATION_PERCENT_DIFF}%) ---")
     # Start with audio boundaries as the absolute first and last anchors
-    all_anchors = [(ref_start_s, foreign_start_s)]
+    all_anchors = ([(visual_prefix["ref_start"], visual_prefix["foreign_end"])]
+                   if visual_prefix else [(ref_start_s, foreign_start_s)])
     added_image_count = 0
     added_forced_count = 0
     skipped_outside = 0
@@ -3610,6 +3678,17 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         is_forced = (ref_name.startswith('FORCED_SYNC_')
                  or ref_name.startswith('AUDIO_TRANSITION_')
                  or ref_name.startswith('AUDIO_REPLACEMENT_'))
+
+        replacement = next(
+            (item for item in AUDIO_REPLACEMENT_RANGES if ref_name.startswith(item["id"])),
+            None,
+        )
+        if (visual_prefix and replacement is not None
+                and replacement["ref_start"] < visual_prefix["ref_start"] < replacement["ref_end"]):
+            logger.info(f"  Skipping {replacement['id']}: visual preamble already covers its "
+                        f"overlapping reference prefix ({replacement['ref_start']:.3f}s-"
+                        f"{replacement['ref_end']:.3f}s).")
+            continue
         
         if is_forced:
             # Forced sync points are always included (that's the point!)
@@ -3619,8 +3698,10 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             logger.info(f"  > FORCED sync point added: Ref={format_time(ref_img_time)} -> Foreign={format_time(foreign_img_time)}")
         else:
             # Check if anchor falls within the content boundaries of BOTH reference and foreign audio
-            is_within_ref = (ref_start_s <= ref_img_time <= ref_end_s)
-            is_within_foreign = (foreign_start_s <= foreign_img_time <= foreign_end_s)
+            anchor_ref_start = visual_prefix["ref_start"] if visual_prefix else ref_start_s
+            anchor_foreign_start = visual_prefix["foreign_end"] if visual_prefix else foreign_start_s
+            is_within_ref = (anchor_ref_start <= ref_img_time <= ref_end_s)
+            is_within_foreign = (anchor_foreign_start <= foreign_img_time <= foreign_end_s)
             if is_within_ref and is_within_foreign:
                 all_anchors.append((ref_img_time, foreign_img_time))
                 added_image_count += 1
@@ -3778,6 +3859,48 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
     processed_segment_files = [] # List to store paths of successfully processed segments
     total_processed_ref_duration = 0.0 # Sum of target durations for processed segments
 
+    if visual_prefix:
+        prefix_target_duration = visual_prefix["foreign_end"] / visual_prefix["source_tempo"]
+        prefix_path = process_segment_iteratively(
+            foreign_wav_full=foreign_wav_full,
+            foreign_start=0.0,
+            foreign_end=visual_prefix["foreign_end"],
+            ref_duration=prefix_target_duration,
+            segment_num=0,
+            temp_dir=temp_dir,
+            max_iterations=3,
+            target_precision_ms=5,
+            fixed_speed=visual_prefix["source_tempo"],
+        )
+        if prefix_path is None:
+            logger.error("-> Failed to preserve foreign preamble before visual program start.")
+            return None, None
+        processed_segment_files.append(prefix_path)
+        actual_prefix_duration = get_file_duration(prefix_path, media_type='audio')
+        if actual_prefix_duration is None:
+            logger.error("-> Failed to measure preserved foreign preamble duration.")
+            return None, None
+        total_processed_ref_duration += actual_prefix_duration
+        visual_padding_duration = visual_prefix["ref_start"] - actual_prefix_duration
+        if visual_padding_duration < -0.005:
+            logger.error(f"-> Fixed-FPS visual preamble ({actual_prefix_duration:.3f}s) exceeds "
+                         f"the reference visual start ({visual_prefix['ref_start']:.3f}s).")
+            return None, None
+        if visual_padding_duration > 0.001:
+            padding_path = os.path.join(temp_dir, "visual_start_padding.wav")
+            padding_cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats",
+                "-f", "lavfi", "-i", f"anullsrc=r={DEFAULT_SAMPLE_RATE}:cl={'stereo' if DEFAULT_CHANNELS == 2 else 'mono'}",
+                "-t", f"{visual_padding_duration:.8f}",
+                "-c:a", "pcm_s16le", "-y", padding_path,
+            ]
+            if not run_ffmpeg(padding_cmd, "Create Visual Start Padding")[0]:
+                return None, None
+            processed_segment_files.append(padding_path)
+            total_processed_ref_duration += visual_padding_duration
+        logger.info(f"  Visual program start aligned: fixed-FPS preamble {actual_prefix_duration:.3f}s + "
+                    f"padding {max(0.0, visual_padding_duration):.3f}s = {visual_prefix['ref_start']:.3f}s")
+
     # Configure iterative processing parameters
     max_iterations = 3       # Max attempts per segment
     target_precision_ms = 5  # Target accuracy in milliseconds
@@ -3878,6 +4001,12 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
                     gain_db = 0.0
 
         # Call the iterative processing function for this segment
+        fixed_speed = None
+        if visual_prefix and i == 0:
+            fixed_speed = visual_prefix["source_tempo"]
+            expected_foreign_end = foreign_start + target_ref_duration * fixed_speed
+            logger.info(f"  -> Segment {segment_num}: Visual-start anchor fixes tempo at {fixed_speed:.6f}x; "
+                        f"next audio-anchor residual {foreign_end - expected_foreign_end:+.3f}s.")
         segment_path = process_segment_iteratively(
             foreign_wav_full=segment_source_wav,
             foreign_start=segment_source_start,
@@ -3891,7 +4020,8 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             is_last_segment=(segment_num == num_segments),
             first_adjust_ms=args.first_segment_adjust,
             last_adjust_ms=args.last_segment_adjust,
-            gain_db=gain_db
+            gain_db=gain_db,
+            fixed_speed=fixed_speed,
         )
 
         if segment_path and os.path.exists(segment_path):
@@ -5033,6 +5163,9 @@ Workflow:
     parser.add_argument("--threshold_calibration_csv", metavar="CSV_PATH", default=None,
         help="Optional: write the noise floor and derived threshold computed for each analyzed "
              "track when --auto_silence_threshold is enabled.")
+    parser.add_argument("--visual_program_bounds", action="store_true",
+        help="Experimental: use matching first non-black video frames to preserve a foreign audio "
+             "preamble at FPS tempo and anchor normal synchronization after the visual program start.")
     parser.add_argument("--no_subtitles", action='store_true', help="Skip subtitle synchronization (enabled by default)")
 
     parser.add_argument("--qc_output_dir", metavar="QC_DIR", default=None, help="Optional: Directory to save side-by-side QC images. By default, no QC images are generated.")

@@ -259,6 +259,19 @@ trazabilidad, no velocidad de proceso.
          la carpeta final con sus checks validados y escuchar de forma
          focalizada los cortes/reemplazos editoriales antes de declarar S01
          validada a oido.
+      - Ancla visual de programa (03/09, experimental): `--visual_program_bounds`
+         detecta con `blackdetect` el primer fotograma no negro de reference y
+         foreign. Para E04: ref 4.588s, source 3.480s. El prólogo source se
+         conserva a tempo FPS fijo (0.959041x), se rellena solo el hueco previo
+         con silencio, y el primer segmento posterior usa el mismo tempo fijo:
+         no hay estiramiento para alcanzar el ancla de audio de 30s. El relleno
+         audio que cruzaba el borde visual se omite para evitar duplicación.
+         `E04_visual_start_fixed_fps_v2_check.mkv` completa con diferencia total
+         de duración 0.073s. El residual contra la primera ancla de audio es
+         -58ms (el segmento fijo termina 72ms antes por cuantización FFmpeg);
+         queda registrado y no se corrige deformando contenido. Pendiente:
+         escucha focalizada E04 0:00-0:35 para decidir si la ancla visual mejora
+         el problema percibido al inicio antes de promoverla o aplicarla a E05/E06.
       - Pendiente: aun no se ha ejecutado el batch completo de la temporada; seguir
          validando episodio a episodio antes de ese paso.
 
