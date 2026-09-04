@@ -272,6 +272,23 @@ trazabilidad, no velocidad de proceso.
          queda registrado y no se corrige deformando contenido. Pendiente:
          escucha focalizada E04 0:00-0:35 para decidir si la ancla visual mejora
          el problema percibido al inicio antes de promoverla o aplicarla a E05/E06.
+      - Criterio de eleccion de hueco silencioso (04/09): `_find_nearby_quiet_interval`
+         comparaba solo duracion (intervalo mas largo gana), sin mirar cuan
+         silencioso era realmente cada candidato. Un doblaje puede tener audio
+         donde la VO calla (p.ej. anunciar el titulo del capitulo en un tramo
+         que en ingles es puro silencio), asi que el punto de corte original
+         puede caer sobre contenido real del doblaje con un hueco largo pero
+         poco silencioso a un lado y uno corto pero realmente silencioso al
+         otro. Cambiado el criterio a: 1) energia real mas baja gana (no solo
+         pasar el umbral), 2) duracion como desempate, 3) proximidad al punto
+         original como ultimo desempate. Radio de busqueda sin cambios (3.0s).
+         Validado con `test_energy_first_quiet_interval.py` (sintetico): un
+         hueco de 1.5s a -37dB pierde frente a uno de 0.3s de silencio real,
+         algo que el criterio anterior (solo duracion) habria elegido al reves.
+         Los tests existentes (`test_per_track_splice_localization.py`,
+         `test_auto_silence_threshold.py`) no detectaban este cambio porque
+         solo tenian un candidato valido por escenario; se mantienen como
+         regresion de las rutas de codigo, no del criterio de ranking.
       - Pendiente: aun no se ha ejecutado el batch completo de la temporada; seguir
          validando episodio a episodio antes de ese paso.
 

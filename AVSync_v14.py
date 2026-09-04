@@ -2923,7 +2923,14 @@ def _find_low_energy_splice(samples, sample_rate, center_time, search_seconds=1.
 
 
 def _find_nearby_quiet_interval(samples, sample_rate, center_time, search_seconds=3.0, threshold_db=-35.0):
-    """Return the longest sustained quiet interval near a splice, for reporting only."""
+    """Return the quietest sustained interval near a splice point.
+
+    A dub can carry audio (e.g. announcing the episode title) exactly where the original
+    track is silent, so the current splice point may sit on real foreign-track content.
+    Candidates are nearby low-energy intervals on either side; the quietest one wins, and
+    duration only breaks ties between similarly-quiet options - a longer but less silent
+    interval is not preferred over a shorter, genuinely quieter one.
+    """
     aa = _import_audio_alignment()
     intervals = aa.detect_silence_intervals(
         samples, sample_rate, threshold_db=threshold_db, min_duration=0.2)
@@ -2933,7 +2940,22 @@ def _find_nearby_quiet_interval(samples, sample_rate, center_time, search_second
     ]
     if not nearby:
         return None
-    return max(nearby, key=lambda interval: (interval[1] - interval[0], -abs((interval[0] + interval[1]) / 2 - center_time)))
+
+    def _interval_rank(interval):
+        start, end = interval
+        start_idx = max(0, int(round(start * sample_rate)))
+        end_idx = min(len(samples), int(round(end * sample_rate)))
+        segment = samples[start_idx:end_idx]
+        if segment.size == 0:
+            energy_db = 0.0
+        else:
+            rms = np.sqrt(np.mean(np.square(segment.astype(np.float64))))
+            energy_db = 20.0 * np.log10(rms + 1e-9)
+        duration = end - start
+        proximity = abs((start + end) / 2.0 - center_time)
+        return (energy_db, -duration, proximity)
+
+    return min(nearby, key=_interval_rank)
 
 
 def _record_threshold_calibration(label, noise_floor_db, threshold_db):
