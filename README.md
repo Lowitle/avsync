@@ -1,4 +1,4 @@
-# AVSync — Audio-to-Audio Dubbing Synchronization Engine
+# AVSync AA — Audio-to-Audio Dubbing Synchronization Engine
 
 ![Python](https://img.shields.io/badge/Python-3.8+-yellow.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
