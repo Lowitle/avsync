@@ -1,5 +1,112 @@
 OBJETIVOS_INMEDIATOS
 
+## OBJETIVO INMEDIATO_10/09/2026 - Consolidacion AVSync AA y siguiente fase AVSync VV
+
+Meta: dejar documentado el flujo de audio-audio ya validado con One Piece y
+preparar la evolucion de video-video para casos donde no haya audios originales
+comparables.
+
+### Estado consolidado de AVSync AA
+
+1. One Piece Netflix/Arait queda validado como caso real de referencia.
+   - Reference: `Z:\projectes\One Piece Multi+NF\Reference`.
+   - Source: `Z:\projectes\One Piece Multi+NF\Source`.
+   - Output batch: `Z:\projectes\One Piece Multi+NF\AVSync_Batch_Output`.
+   - Resultado del batch completo: 53/53 episodios OK.
+
+2. Configuracion validada para este flujo:
+   - Comparacion/anclaje: japones contra japones (`reference #9` vs `source #2`).
+   - Audio final añadido: español Netflix (`source #1`).
+   - Flags clave:
+     `--anchor_source audio --ref_stream_idx 9 --foreign_stream_idx 1
+      --foreign_anchor_stream_idx 2 --foreign_tracks 1 --foreign_lang spa
+      --missing_foreign_fill reference --no_subtitles`.
+
+3. Politica de tramos reference-only.
+   - Un salto negativo estable de offset indica contenido presente en reference y
+     ausente en source: eyecatch, censura, tramo sin doblar o final no presente.
+   - El motor genera anchors forzados con el mismo tiempo source para que el tramo
+     se renderice como segmento de referencia real, no como estiramiento.
+   - Se repite para todos los saltos detectados; no esta limitado a un unico
+     eyecatch por episodio.
+
+4. Refinamiento de bordes validado.
+   - El inicio usa evidencia local de offset y acepta un primer probe post-corte
+     si una racha posterior confirma el nuevo estado.
+   - Para entradas musicales suaves, el inicio se refina con la envolvente del
+     reference y conserva un pequeño pre-roll.
+   - El final se refina contra un punto de baja energia local para no cortar el
+     audio reference insertado a mitad de nota.
+   - E01 y E08 fueron los casos de ajuste fino; E08 v6 corrigio el inicio de
+     eyecatch a `00:09:46.000` y el batch final hereda esa politica.
+
+5. Pendiente de QA manual.
+   - Escuchar una muestra representativa del batch final, especialmente episodios
+     con `Located missing foreign interval` en log.
+   - Revisar que los nombres/metadatos finales se ajusten en MKVToolNix si se desea
+     renombrar la pista Arait/Netflix.
+
+### Plan numerado para AVSync VV
+
+1. Crear un modo de analisis visual sin modificar salida.
+   - Entrada: reference/source.
+   - Salida: `visual_map_report.csv` y QC opcional.
+   - Objetivo: observar el mapa de escenas antes de aplicar recetas.
+   - Estado: IMPLEMENTADO (10/09). Nuevo modo `--visual_map_only` con
+     `--visual_map_report_csv` y `--visual_map_qc_dir` opcional. No sincroniza
+     audio ni muxea, y sale antes de seleccionar pistas de audio.
+     Prueba smoke E01 One Piece: `S01E0001_visual_map_smoke.csv` generado con
+     1304 filas usando `--scene_threshold 0.35`; timestamps source normalizados
+     con `compute_auto_source_tempo()` (factor 1.001000000).
+
+2. Normalizar timeline source por FPS.
+   - Reutilizar `compute_auto_source_tempo()`.
+   - Comparar timestamps visuales source como `source_time / source_tempo`.
+   - No reencodear video para el analisis; solo transformar tiempos.
+
+3. Clasificar cambios de escena.
+   - Para cada cambio detectado por FFmpeg, inspeccionar frames antes/despues.
+   - Clasificar: negro->imagen, imagen->negro, imagen->imagen, fade-in,
+     fade-out, negro sostenido, ambiguo.
+   - Usar luminancia media, porcentaje de pixeles oscuros y diferencia de frames.
+
+4. Construir mapa de duraciones visuales.
+   - Duracion de cada escena.
+   - Duracion de pantallas negras.
+   - Tipo de transicion de entrada/salida.
+   - Frame representativo y score de similitud.
+
+5. Generar curva densa de offset visual.
+   - Entre anchors visuales, samplear cada 1-2s.
+   - Estimar offset local por template matching/pHash/histograma.
+   - Exportar `visual_transition_report.csv` equivalente al de audio-audio.
+
+6. Detectar saltos visuales abruptos.
+   - Distinguir drift/FPS de salto editorial.
+   - Confirmar racha anterior y racha posterior.
+   - No estirar un segmento completo si hay evidencia de corte interno.
+
+7. Refinar transiciones visuales.
+   - Usar primer frame post-corte confirmado, ultimo frame pre-corte,
+     bordes de negro/fade y minima diferencia de movimiento.
+   - Generar una ventana candidata con confianza y razon.
+
+8. Convertir hallazgos visuales en receta comun.
+   - Estructura: `reference_start`, `reference_end`, `source_splice_time`,
+     tipo (`reference_only`, `source_only`, `different_edit`, `black_mismatch`),
+     confianza y razon.
+   - Reutilizar el renderizador de segmentos/anchors forzados de audio-audio.
+
+9. Soportar multiples intervalos por episodio.
+   - Ordenar, detectar solapes y resolver contradicciones antes de renderizar.
+   - Mantener logs legibles de cada decision.
+
+10. Validar en fases.
+   - Primero CSV/QC sin tocar audio.
+   - Luego un episodio problematico con receta aplicada.
+   - Despues batch pequeno.
+   - Solo al final batch completo.
+
 ## OBJETIVO INMEDIATO_29/08/2026 - Densidad y fiabilidad de anclajes de audio
 
 Meta: lograr una cadena de anclajes verificables y continua, especialmente en
@@ -288,6 +395,68 @@ trazabilidad, no velocidad de proceso.
          Los tests existentes (`test_per_track_splice_localization.py`,
          `test_auto_silence_threshold.py`) no detectaban este cambio porque
          solo tenian un candidato valido por escenario; se mantienen como
+         regresion.
+      - Evaluacion independiente de reemplazos y desalojo de anclas gruesas (04/09):
+         Al relanzar E04 con el ranking por energia, se descubrieron dos bloqueos
+         arquitectonicos en la reubicacion de cortes:
+         1) `_move_replacements_to_quiet_primary_splices` evaluaba la monotonia
+            de forma transaccional "todo o nada", de modo que si un solo reemplazo
+            del capitulo rompia la monotonia, se descartaban TODOS los movimientos
+            del capitulo. Rediseñado para evaluar y aceptar/rechazar cada reemplazo
+            individualmente, de modo que un candidato no monotonico se descarta
+            de forma aislada sin vetar otros reemplazos seguros. Validado con el nuevo
+            test `test_independent_replacement_relocation.py`.
+         2) En Stage 1 (`_scan_audio_anchors`), al detectar un tramo faltante
+            (AUDIO_REPLACEMENT) como el de E04 en 119.900s-123.520s, las anclas gruesas
+            previamente escaneadas dentro de ese rango (p.ej. ref 120.0s -> foreign 110.6s)
+            quedaban en `refined_anchors`. Como esa ancla gruesa ya traia el offset
+            post-salto, entraba en contradiccion de orden temporal con el punto de
+            corte pre-salto (ref 119.9s -> foreign 114.016s), haciendo que cualquier
+            propuesta de movimiento fuera geometricamente no monotonica. Añadido el
+            desalojo de anclas gruesas encerradas por tramos de contenido faltante.
+         Resultado en E04 (`E04_fixed_relocation.mkv`): `AUDIO_REPLACEMENT_0003` se reubica
+         con exito a `ref 591.987s-593.671s, source 563.290s (shift +0.035s)`, y el tramo
+         de las salchichas (119.900s-123.520s) se sincroniza limpiamente sin anomalías de
+         anclas intermedias. Duracion final clavada a 1227.308s (diferencia 0.070s).
+      - Colocacion de padding visual en el segundo 0:00s (05/09):
+         En la implementacion previa del ancla visual (`--visual_program_bounds`), el
+         prologo source (0:00 a `foreign_visual_start`) se renderizaba primero, y el
+         padding de silencio para alcanzar `ref_visual_start` (4.588s en E04) se colocaba
+         a continuacion (justo antes del primer fotograma util). Esto creaba un corte con
+         silencio en medio de la locucion inicial (p.ej. "En el capitulo anterior...")
+         en vez de adelantar el silencio a la cabecera de negro.
+         Cambiado el orden en `run_progressive_sync_iterative`: ahora el silencio de padding
+         (`visual_padding_duration`) se coloca en el segundo 0:00s (dentro del negro de
+         referencia), seguido de todo el prologo foreign a tempo FPS fijo. De este modo,
+         la locucion en español entra justo en su posicion natural y empalma de forma continua
+         con el arranque del programa en 4.588s sin ningun hueco intermedio.
+         Validado con `E04_padding_at_zero.mkv`.
+      - Correccion de timeout en blackdetect y exclusion total de anclas previas al inicio visual (05/09):
+         En E02 se detecto que el audio inicial se duplicaba / repetia. La investigacion revelo dos causas:
+         1) `find_visual_program_bounds` ejecutaba `blackdetect` sobre todo el video (20+ min HEVC 1080p),
+            superando el timeout de 120s en E02 y abortando a la deteccion por audio tradicional.
+            Optimizada la deteccion para escanear unicamente los primeros y ultimos 60s del video
+            (`-t 60` / `-ss <dur-60>`), reduciendo el tiempo de 120s+ a apenas 3.3s.
+         2) `AUDIO_REPLACEMENT_0001` (2.002s-2.972s) quedaba estrictamente antes de `ref_visual_start`
+            (5.547s). El filtro anterior solo descartaba reemplazos que cruzaran el borde visual,
+            dejando pasar este reemplazo previo con `foreign_time=0.0s`. Como resultado, el tramo
+            `0.0s - 4.480s` se renderizaba una vez en el prologo visual y otra vez en el segmento 2
+            a partir de `0.0s`. Corregido el filtro para descartar cualquier ancla/reemplazo con
+            `ref_time <= visual_prefix["ref_start"]` o `foreign_time <= visual_prefix["foreign_end"]`.
+         Resultado en E02 (`E02_fixed_visual_start.mkv`): Deteccion visual en 3.3s (ref 5.547s, foreign 4.480s),
+         padding 0.885s en 0:00s, prologo continuo y paso limpio al segmento 1 (5.547s -> 30.0s) sin
+         ninguna repeticion de audio. Duracion final de audio 1246.255s (diferencia 0.114s).
+      - Agotamiento de audio foreign al final (07/09): S02E08 revelo un caso distinto de
+         desajuste editorial: despues de la ultima ancla comun (ref 1233.000s -> foreign
+         1182.929s), solo quedaban 2.099s de doblaje para los 21.332s finales de la referencia.
+         El motor llegaba al limite `atempo=0.5`, producia 4.174s y despues anadia 17.157s
+         de silencio, una combinacion que mantenia la duracion pero deformaba el contenido.
+         Nueva regla: si el ultimo tramo requiere una velocidad menor de 0.5x, se trata como
+         audio foreign agotado y se genera directamente un relleno editorial de la duracion
+         objetivo; copia audio de referencia solo cuando ambos bordes son puntos seguros y,
+         en caso contrario, usa silencio. Validado con `E08_exhausted_foreign_fill_check.mkv`:
+         eligio silencio por seguridad, no ejecuto estiramiento extremo y quedo a 0.022s de
+         la duracion de referencia.
          regresion de las rutas de codigo, no del criterio de ranking.
       - Pendiente: aun no se ha ejecutado el batch completo de la temporada; seguir
          validando episodio a episodio antes de ese paso.

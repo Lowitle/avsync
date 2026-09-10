@@ -246,6 +246,7 @@ def get_cache_key(args):
         'audio_anchor_search_radius': getattr(args, 'audio_anchor_search_radius', None),
         'source_tempo': getattr(args, 'source_tempo', None),
         'foreign_anchor_stream_idx': getattr(args, 'foreign_anchor_stream_idx', None),
+        'missing_foreign_fill': getattr(args, 'missing_foreign_fill', 'auto'),
     }
     
     cache_str = json.dumps(cache_params, sort_keys=True)
@@ -267,7 +268,7 @@ def get_cache_path(args):
 def save_checkpoint(cache_path, visual_anchors_details):
     """Save checkpoint data to disk"""
     checkpoint_data = {
-        'version': 17,
+        'version': 20,
         'visual_anchors_details': visual_anchors_details,
         # Anchor pairing also derives this global state (gap-fill ranges, silence-based
         # editorial edits); it must travel with the anchors or segment processing breaks
@@ -298,7 +299,7 @@ def load_checkpoint(cache_path):
         with open(cache_path, 'rb') as f:
             checkpoint_data = pickle.load(f)
         
-        if checkpoint_data.get('version') != 15:
+        if checkpoint_data.get('version') != 20:
             logger.warning(f"[CACHE] Version mismatch, ignoring cache")
             return None
             
@@ -1225,34 +1226,57 @@ def get_file_duration(file_path, media_type='audio'):
         return None
 
 
-def find_visual_program_bounds(video_path, minimum_black_seconds=0.2):
+def find_visual_program_bounds(video_path, minimum_black_seconds=0.2, scan_margin_seconds=60.0):
     """Return the first and last non-black video timestamps, when detectable.
 
     This deliberately does not assume that audio silence matches video black:
     dubbed releases can announce the episode title while the picture is still
     black. ``None`` is returned for either boundary when the video has no
     qualifying black lead-in/trailer, so callers can safely retain audio bounds.
+    Only the lead-in and trailer margins are scanned to avoid decoding the full video.
     """
     duration = get_file_duration(video_path, media_type='video')
     if duration is None:
         return None, None
+    visual_start = None
+    visual_end = None
+    scan_len = min(duration, scan_margin_seconds)
     try:
-        command = [
-            FFMPEG_EXEC, "-hide_banner", "-v", "info", "-i", video_path,
+        # Scan lead-in (first scan_len seconds)
+        lead_cmd = [
+            FFMPEG_EXEC, "-hide_banner", "-v", "info", "-t", f"{scan_len:.3f}",
+            "-i", video_path,
             "-vf", f"blackdetect=d={minimum_black_seconds}:pix_th=0.10",
             "-an", "-f", "null", "-",
         ]
-        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=120)
+        lead_res = subprocess.run(lead_cmd, capture_output=True, text=True, check=False, timeout=30)
+        lead_ranges = [
+            (float(match.group(1)), float(match.group(2)))
+            for match in re.finditer(r"black_start:([0-9.]+)\s+black_end:([0-9.]+)", lead_res.stderr)
+        ]
+        visual_start = next((end for start, end in lead_ranges if start <= 0.1), None)
+
+        # Scan trailer (last scan_len seconds) if video is longer than margin
+        if duration > scan_len:
+            tail_offset = duration - scan_len
+            tail_cmd = [
+                FFMPEG_EXEC, "-hide_banner", "-v", "info", "-ss", f"{tail_offset:.3f}",
+                "-i", video_path,
+                "-vf", f"blackdetect=d={minimum_black_seconds}:pix_th=0.10",
+                "-an", "-f", "null", "-",
+            ]
+            tail_res = subprocess.run(tail_cmd, capture_output=True, text=True, check=False, timeout=30)
+            tail_ranges = [
+                (float(match.group(1)) + tail_offset, float(match.group(2)) + tail_offset)
+                for match in re.finditer(r"black_start:([0-9.]+)\s+black_end:([0-9.]+)", tail_res.stderr)
+            ]
+            visual_end = next((start for start, end in reversed(tail_ranges) if end >= duration - 0.1), None)
+        else:
+            visual_end = next((start for start, end in reversed(lead_ranges) if end >= duration - 0.1), None)
     except Exception as error:
         logger.warning(f"  Visual program-boundary detection skipped for {os.path.basename(video_path)}: {error}")
         return None, None
 
-    black_ranges = [
-        (float(match.group(1)), float(match.group(2)))
-        for match in re.finditer(r"black_start:([0-9.]+)\s+black_end:([0-9.]+)", result.stderr)
-    ]
-    visual_start = next((end for start, end in black_ranges if start <= 0.1), None)
-    visual_end = next((start for start, end in reversed(black_ranges) if end >= duration - 0.1), None)
     return visual_start, visual_end
 
 # --- Image Pairing Stage Functions ---
@@ -1313,6 +1337,73 @@ def extract_frames_ffmpeg(video_path, output_folder, scene_threshold):
 
     logger.info(f"> Extracted {final_count} scene frames from {vid_name}")
     return True, [os.path.basename(f) for f in frame_files], parsed_pts_times
+
+
+def write_visual_map_report(args, temp_dir):
+    """Write an analysis-only map of scene-change frames for reference/source videos."""
+    if not args.visual_map_report_csv:
+        logger.error("Visual map analysis requires --visual_map_report_csv.")
+        return False
+
+    logger.info("\n===== Visual Map Analysis Stage =====")
+    ref_extract_path = os.path.join(temp_dir, "VisualMap_Reference")
+    source_extract_path = os.path.join(temp_dir, "VisualMap_Source")
+
+    ref_ok, ref_filenames, ref_times = extract_frames_ffmpeg(
+        args.ref_video, ref_extract_path, args.scene_threshold)
+    source_ok, source_filenames, source_times = extract_frames_ffmpeg(
+        args.foreign_video, source_extract_path, args.scene_threshold)
+    if not ref_ok or not source_ok:
+        return False
+
+    source_tempo = args.source_tempo
+    if source_tempo is None:
+        source_tempo = compute_auto_source_tempo(args.ref_video, args.foreign_video)
+    else:
+        logger.info(f"  Visual map using manual FPS normalization factor={source_tempo:.9f}")
+
+    rows = []
+    for side, video_path, filenames, raw_times, tempo in (
+            ("reference", args.ref_video, ref_filenames, ref_times, 1.0),
+            ("source", args.foreign_video, source_filenames, source_times, source_tempo)):
+        previous_normalized = None
+        for index, (filename, raw_time) in enumerate(zip(filenames, raw_times), start=1):
+            normalized_time = raw_time / tempo if tempo else raw_time
+            delta = "" if previous_normalized is None else f"{normalized_time - previous_normalized:.6f}"
+            rows.append([
+                side, index, filename, f"{raw_time:.6f}", f"{normalized_time:.6f}",
+                delta, f"{tempo:.9f}", os.path.basename(video_path),
+            ])
+            previous_normalized = normalized_time
+
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(args.visual_map_report_csv)), exist_ok=True)
+        with open(args.visual_map_report_csv, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                "side", "scene_index", "frame_name", "raw_time", "normalized_time",
+                "delta_from_previous", "timeline_factor", "video_name",
+            ])
+            writer.writerows(rows)
+        logger.info(f"  -> Wrote {len(rows)} visual map rows to {args.visual_map_report_csv}")
+    except Exception as error:
+        logger.error(f"Failed to write visual map report '{args.visual_map_report_csv}': {error}")
+        return False
+
+    if args.visual_map_qc_dir:
+        try:
+            for label, folder in (("reference", ref_extract_path), ("source", source_extract_path)):
+                target_dir = os.path.join(args.visual_map_qc_dir, label)
+                os.makedirs(target_dir, exist_ok=True)
+                for frame_path in glob.glob(os.path.join(folder, "frame_*.png")):
+                    shutil.copy2(frame_path, os.path.join(target_dir, os.path.basename(frame_path)))
+            logger.info(f"  -> Copied visual map scene frames to {args.visual_map_qc_dir}")
+        except Exception as error:
+            logger.error(f"Failed to copy visual map QC frames: {error}")
+            return False
+
+    logger.info("---=== Visual Map Analysis Stage Finished Successfully ===---")
+    return True
 
 def _prepare_frame_for_matching(gray_frame):
     """Letterbox-resize to RESIZE_WIDTH x RESIZE_HEIGHT preserving aspect ratio, then mild blur.
@@ -1810,6 +1901,15 @@ def resolve_anchor_stream_indices(args):
     return ref_idx, foreign_idx
 
 
+def should_fill_missing_foreign_with_silence(fill_policy, *safe_splice_points):
+    """Decide whether a missing-foreign reference interval should be neutral silence."""
+    if fill_policy == "reference":
+        return False
+    if fill_policy == "silence":
+        return True
+    return not all(safe_splice_points)
+
+
 def _import_audio_alignment():
     """Import the sibling audio_alignment module regardless of the current working directory."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1913,6 +2013,17 @@ def _locate_transition_point(reference, source, aa, sample_rate, ref_lo, ref_hi,
             band_start = before_run[-1][0]
             band_end = after_run[0][0]
             if 0 < band_end - band_start <= 45.0:
+                # A musical pickup can make the first post-cut probe ambiguous.
+                # If a later stable after-run confirms the new offset, retain the
+                # earliest isolated after probe instead of waiting for the loud body.
+                if offset_after < offset_before:
+                    earlier_after = next(
+                        (time for time, state in state_samples
+                         if band_start < time < band_end and state == "after"),
+                        None,
+                    )
+                    if earlier_after is not None and after_run[0][0] - earlier_after <= 10.0:
+                        return earlier_after, True
                 start_sample = int(band_start * sample_rate)
                 end_sample = int(band_end * sample_rate)
                 frame_samples = max(1, int(0.05 * sample_rate))
@@ -1997,6 +2108,128 @@ def _measure_local_audio_offset(reference, source, aa, sample_rate, ref_time,
             and abs(waveform_offset - envelope_offset) > 0.15):
         return None
     return (envelope_offset, envelope_confidence) if envelope_confidence >= waveform_confidence else (waveform_offset, waveform_confidence)
+
+
+def _locate_missing_reference_start(reference, source, aa, sample_rate, ref_lo, ref_hi,
+                                    offset_before, offset_after,
+                                    probe_window_seconds=4.0, probe_step_seconds=1.0):
+    departure_threshold = max(0.5, min(2.0, abs(offset_after - offset_before) * 0.20))
+    window_samples = int(probe_window_seconds * sample_rate)
+
+    def _reference_onset_time(center_time):
+        # Eyecatches often begin with a quiet musical pickup. Use the reference
+        # envelope to preserve that pickup instead of cutting at its first loud frame.
+        frame_seconds = 0.05
+        frame_samples = max(1, int(frame_seconds * sample_rate))
+        search_start = max(ref_lo, center_time - 0.75)
+        search_end = min(ref_hi, center_time + 1.25)
+        measurements = []
+        for candidate_time in np.arange(search_start, search_end + 1e-9, frame_seconds):
+            start = int(candidate_time * sample_rate)
+            end = start + frame_samples
+            if start < 0 or end > len(reference):
+                continue
+            frame = reference[start:end].astype(np.float64)
+            rms_db = 20.0 * np.log10(float(np.sqrt(np.mean(np.square(frame)))) + 1e-9)
+            measurements.append((candidate_time, rms_db))
+        if len(measurements) < 12:
+            return None
+
+        baseline_values = [db for time, db in measurements if time <= center_time - 0.25]
+        baseline_db = float(np.median(baseline_values)) if baseline_values else measurements[0][1]
+        threshold_db = baseline_db + 2.0
+        for index, (candidate_time, rms_db) in enumerate(measurements):
+            if candidate_time < center_time - 0.15 or rms_db < threshold_db:
+                continue
+            following = [db for _, db in measurements[index:index + 6]]
+            if len(following) >= 4 and sum(db >= threshold_db for db in following) >= 3:
+                return max(ref_lo, candidate_time - 0.10)
+        return None
+
+    def _quietest_splice_time(center_time):
+        # The coarse detector works at one-second resolution. Once it finds the
+        # transition neighbourhood, put the actual edit on the quietest short frame
+        # shared by the reference and the pre-cut source alignment.
+        search_start = max(ref_lo, center_time - 0.25)
+        search_end = min(ref_hi, center_time + 1.25)
+        frame_samples = max(1, int(0.02 * sample_rate))
+        best = None
+        for candidate_time in np.arange(search_start, search_end + 1e-9, 0.01):
+            ref_start = int(candidate_time * sample_rate)
+            src_start = int((candidate_time + offset_before) * sample_rate)
+            ref_end = ref_start + frame_samples
+            src_end = src_start + frame_samples
+            if (ref_start < 0 or ref_end > len(reference)
+                    or src_start < 0 or src_end > len(source)):
+                continue
+            ref_frame = reference[ref_start:ref_end].astype(np.float64)
+            src_frame = source[src_start:src_end].astype(np.float64)
+            ref_rms = float(np.sqrt(np.mean(np.square(ref_frame))))
+            src_rms = float(np.sqrt(np.mean(np.square(src_frame))))
+            score = max(ref_rms, src_rms)
+            if best is None or score < best[0]:
+                best = (score, candidate_time)
+        return best[1] if best is not None else center_time
+
+    measurements = []
+    for ref_time in np.arange(ref_lo, ref_hi + 1e-6, probe_step_seconds):
+        ref_start = int(ref_time * sample_rate)
+        ref_end = ref_start + window_samples
+        if ref_start < 0 or ref_end > len(reference):
+            continue
+        reference_window = reference[ref_start:ref_end]
+        expected_offset = offset_before
+        source_start = max(0, int((ref_time + expected_offset - 5.0) * sample_rate))
+        source_end = min(len(source), int((ref_time + expected_offset + probe_window_seconds + 5.0) * sample_rate))
+        source_window = source[source_start:source_end]
+        if len(source_window) < len(reference_window):
+            continue
+        try:
+            waveform_offset, waveform_confidence = aa.correlate_offset(
+                reference_window, source_window, sample_rate)
+        except ValueError:
+            continue
+        waveform_offset += source_start / sample_rate - ref_time
+        measurements.append((ref_time, waveform_offset, waveform_confidence))
+
+    for index, (ref_time, waveform_offset, waveform_confidence) in enumerate(measurements):
+        if waveform_confidence < 1.0 or abs(waveform_offset - offset_before) <= departure_threshold:
+            continue
+        neighbours = measurements[index + 1:index + 3]
+        if any(confidence >= 1.0 and abs(offset - offset_before) > departure_threshold
+               for _, offset, confidence in neighbours):
+            coarse_start = max(ref_lo, ref_time - probe_step_seconds)
+            onset = _reference_onset_time(coarse_start)
+            if onset is not None:
+                return onset
+            return _quietest_splice_time(coarse_start)
+    return None
+
+
+def _locate_quiet_reference_edge(reference, source, sample_rate, center_time,
+                                 expected_offset, search_before=1.0, search_after=1.5):
+    """Move a replacement edge to the quietest nearby shared 20ms frame."""
+    frame_samples = max(1, int(0.02 * sample_rate))
+    best = None
+    for candidate_time in np.arange(
+            max(0.0, center_time - search_before),
+            center_time + search_after + 1e-9,
+            0.01):
+        ref_start = int(candidate_time * sample_rate)
+        source_start = int((candidate_time + expected_offset) * sample_rate)
+        ref_end = ref_start + frame_samples
+        source_end = source_start + frame_samples
+        if (ref_start < 0 or ref_end > len(reference)
+                or source_start < 0 or source_end > len(source)):
+            continue
+        reference_frame = reference[ref_start:ref_end].astype(np.float64)
+        source_frame = source[source_start:source_end].astype(np.float64)
+        reference_rms = float(np.sqrt(np.mean(np.square(reference_frame))))
+        source_rms = float(np.sqrt(np.mean(np.square(source_frame))))
+        score = max(reference_rms, source_rms)
+        if best is None or score < best[0]:
+            best = (score, candidate_time)
+    return best[1] if best is not None else center_time
 
 
 def _write_transition_report_csv(path, reference, source, aa, sample_rate, anchor_offsets,
@@ -2124,7 +2357,8 @@ def _has_two_sided_transition_evidence(reference, source, sample_rate, transitio
 def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, foreign_stream_idx,
                             source_tempo, window_seconds, step_seconds, min_confidence,
                             search_radius_seconds=20.0, agreement_seconds=0.15, jump_tolerance_seconds=0.15,
-                            anchor_report_csv=None, transition_report_csv=None):
+                            anchor_report_csv=None, transition_report_csv=None, visual_program_bounds=False,
+                            missing_foreign_fill="auto"):
     """Generate sync anchors via audio cross-correlation instead of visual frame matching.
 
     Intended for pairs where resolution/compression/aspect-ratio mismatch makes template
@@ -2321,6 +2555,88 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
     first_full_anchor = min(anchors, key=lambda item: item[2])
     last_full_anchor = anchors[-1]
     last_full_anchor_offset = anchor_offsets[-1]
+    visual_start_anchor = None
+    visual_end_anchor = None
+    if visual_program_bounds:
+        ref_visual_start, ref_visual_end = find_visual_program_bounds(ref_video_path)
+        foreign_visual_start, foreign_visual_end = find_visual_program_bounds(foreign_video_path)
+        if ref_visual_start is not None and foreign_visual_start is not None:
+            visual_start_anchor = (ref_visual_start, foreign_visual_start / source_tempo - ref_visual_start)
+            logger.info(f"  Visual-start-guided audio search: ref {ref_visual_start:.3f}s, "
+                        f"foreign {foreign_visual_start:.3f}s")
+        if ref_visual_end is not None and foreign_visual_end is not None:
+            visual_end_anchor = (ref_visual_end, foreign_visual_end / source_tempo - ref_visual_end)
+            logger.info(f"  Visual-end-guided audio search: ref {ref_visual_end:.3f}s, "
+                        f"foreign {foreign_visual_end:.3f}s")
+
+    if (visual_start_anchor is not None
+            and first_full_anchor[2] - visual_start_anchor[0] >= 4.0):
+        visual_ref_start, visual_offset = visual_start_anchor
+        visual_partial_anchor = aa.find_partial_anchor(
+            reference,
+            source,
+            sample_rate,
+            reference_start=visual_ref_start,
+            reference_end=first_full_anchor[2],
+            source_end=first_full_anchor[3] / source_tempo,
+            expected_offset=visual_offset,
+            window_seconds=min(2.0, window_seconds / 10.0),
+            step_seconds=0.5,
+            search_radius_seconds=8.0,
+            min_confidence=1.5,
+            agreement_seconds=0.2,
+            min_consistent_matches=2,
+            prefer='earliest',
+        )
+        if visual_partial_anchor is not None:
+            visual_partial_foreign_time = visual_partial_anchor.source_time * source_tempo
+            anchors.insert(0, (
+                "AUDIO_VISUAL_START_0001_ref",
+                "AUDIO_VISUAL_START_0001_foreign",
+                visual_partial_anchor.reference_time,
+                visual_partial_foreign_time,
+            ))
+            anchor_offsets.insert(0, visual_partial_anchor.offset_seconds)
+            logger.info(
+                f"  Visual-start-guided anchor recovered: ref {visual_partial_anchor.reference_time:.3f}s -> "
+                f"foreign {visual_partial_foreign_time:.3f}s (offset {visual_partial_anchor.offset_seconds:+.3f}s, "
+                f"confidence {visual_partial_anchor.confidence:.2f})"
+            )
+            first_full_anchor = min(anchors, key=lambda item: item[2])
+
+    if (visual_end_anchor is not None
+            and visual_end_anchor[0] - last_full_anchor[2] >= 4.0):
+        visual_ref_end, visual_offset = visual_end_anchor
+        visual_partial_end_anchor = aa.find_partial_anchor(
+            reference,
+            source,
+            sample_rate,
+            reference_start=last_full_anchor[2],
+            reference_end=visual_ref_end,
+            source_end=foreign_visual_end / source_tempo,
+            expected_offset=visual_offset,
+            window_seconds=min(2.0, window_seconds / 10.0),
+            step_seconds=0.5,
+            search_radius_seconds=8.0,
+            min_confidence=1.5,
+            agreement_seconds=0.2,
+            min_consistent_matches=2,
+            prefer='latest',
+        )
+        if visual_partial_end_anchor is not None:
+            visual_partial_end_foreign_time = visual_partial_end_anchor.source_time * source_tempo
+            anchors.append((
+                "AUDIO_VISUAL_END_0001_ref",
+                "AUDIO_VISUAL_END_0001_foreign",
+                visual_partial_end_anchor.reference_time,
+                visual_partial_end_foreign_time,
+            ))
+            anchor_offsets.append(visual_partial_end_anchor.offset_seconds)
+            logger.info(
+                f"  Visual-end-guided anchor recovered: ref {visual_partial_end_anchor.reference_time:.3f}s -> "
+                f"foreign {visual_partial_end_foreign_time:.3f}s (offset {visual_partial_end_anchor.offset_seconds:+.3f}s, "
+                f"confidence {visual_partial_end_anchor.confidence:.2f})"
+            )
     if first_full_anchor[2] > window_seconds * 0.5:
         partial_anchor = aa.find_partial_anchor(
             reference,
@@ -2576,7 +2892,10 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
             replacement_foreign_time = 0.0
             # Copying HQ reference content only makes sense if the cut point is a
             # natural pause; otherwise it would hard-cut mid-note/mid-phrase.
-            use_silence = not aa.is_safe_splice_point(reference, sample_rate, replacement_end)
+            use_silence = should_fill_missing_foreign_with_silence(
+                missing_foreign_fill,
+                aa.is_safe_splice_point(reference, sample_rate, replacement_end),
+            )
             AUDIO_REPLACEMENT_RANGES.append({
                 "id": replacement_id,
                 "ref_start": replacement_start,
@@ -2603,7 +2922,10 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
             if replacement_start > 0.0 and replacement_end < first_ref_time:
                 transition_count += 1
                 replacement_id = f"AUDIO_REPLACEMENT_{transition_count:04d}"
-                use_silence = not aa.is_safe_splice_point(reference, sample_rate, replacement_end)
+                use_silence = should_fill_missing_foreign_with_silence(
+                    missing_foreign_fill,
+                    aa.is_safe_splice_point(reference, sample_rate, replacement_end),
+                )
                 AUDIO_REPLACEMENT_RANGES.append({
                     "id": replacement_id,
                     "ref_start": replacement_start,
@@ -2655,7 +2977,8 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
             (anchor[2] for anchor in anchors if anchor[2] > ref_time_j + 0.001),
             ref_time_j + 30.0,
         )
-        search_hi = min(following_anchor_time, ref_time_j + 30.0, len(reference) / sample_rate)
+        search_hi = min(following_anchor_time + abs(offset_j - offset_i),
+                        ref_time_j + 30.0, len(reference) / sample_rate)
         if search_hi > ref_time_j:
             logger.debug(f"    Extending transition evidence from ref {ref_time_j:.3f}s to {search_hi:.3f}s")
         transition_ref_time, transition_validated = _locate_transition_point(
@@ -2670,18 +2993,48 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
         if delta < 0:
             missing_ref_duration = abs(delta) / source_tempo
             replacement_start = transition_ref_time
+            if missing_foreign_fill == "reference":
+                earlier_start = _locate_missing_reference_start(
+                    reference, source, aa, sample_rate,
+                    ref_time_i, search_hi, offset_i, offset_j)
+                if earlier_start is not None and earlier_start < replacement_start:
+                    logger.info(
+                        f"  Refined missing-foreign start from {replacement_start:.3f}s "
+                        f"to {earlier_start:.3f}s using local offset departure"
+                    )
+                    replacement_start = earlier_start
             replacement_end = transition_ref_time + missing_ref_duration
+            if replacement_start != transition_ref_time:
+                replacement_end = replacement_start + missing_ref_duration
+                before_foreign_time = (replacement_start + offset_i) * source_tempo
+            if missing_foreign_fill == "reference":
+                quiet_end = _locate_quiet_reference_edge(
+                    reference, source, sample_rate, replacement_end, offset_j)
+                if quiet_end > replacement_end:
+                    logger.info(
+                        f"  Refined missing-foreign end from {replacement_end:.3f}s "
+                        f"to {quiet_end:.3f}s using local energy minimum"
+                    )
+                    replacement_end = quiet_end
+                    before_foreign_time = (replacement_end + offset_j) * source_tempo
             if not transition_validated:
                 logger.info(f"  Skipping unsupported missing-foreign fill near ref {transition_ref_time:.3f}s: "
                             "the local transition classifier found no two-sided evidence")
                 continue
-            if (replacement_start > ref_time_i and replacement_end < search_hi
+            replacement_limit = next(
+                (anchor[2] for anchor in anchors if anchor[2] > replacement_end + 0.001),
+                len(reference) / sample_rate,
+            )
+            if (replacement_start > ref_time_i and replacement_end < replacement_limit
                     and before_foreign_time >= 0):
                 transition_count += 1
                 replacement_id = f"AUDIO_REPLACEMENT_{transition_count:04d}"
                 # This gap is spliced in on both sides, so both boundaries must be safe cut points.
-                use_silence = not (aa.is_safe_splice_point(reference, sample_rate, replacement_start)
-                                    and aa.is_safe_splice_point(reference, sample_rate, replacement_end))
+                use_silence = should_fill_missing_foreign_with_silence(
+                    missing_foreign_fill,
+                    aa.is_safe_splice_point(reference, sample_rate, replacement_start),
+                    aa.is_safe_splice_point(reference, sample_rate, replacement_end),
+                )
                 AUDIO_REPLACEMENT_RANGES.append({
                     "id": replacement_id,
                     "ref_start": replacement_start,
@@ -2697,9 +3050,17 @@ def run_audio_pairing_stage(ref_video_path, foreign_video_path, ref_stream_idx, 
                 logger.info(f"  Located missing foreign interval at ref {replacement_start:.3f}s-"
                             f"{replacement_end:.3f}s (jump {delta:+.3f}s) -> "
                             f"filling it with {fill_desc} instead of silence/stretching")
+                # Remove coarse anchors enclosed by this missing-foreign interval: they carry
+                # post-jump offsets at timestamps that exist only in reference audio, which would
+                # break monotonic foreign progression inside the replacement interval.
+                refined_anchors = [
+                    a for a in refined_anchors
+                    if a[0].startswith("AUDIO_REPLACEMENT_")
+                    or not (replacement_start <= a[2] <= replacement_end)
+                ]
             else:
                 logger.debug(f"    Skipping audio replacement near ref {transition_ref_time:.3f}s: "
-                             f"not enough room in [{ref_time_i:.3f}, {search_hi:.3f}]")
+                             f"not enough room in [{ref_time_i:.3f}, {replacement_limit:.3f}]")
             continue
 
         epsilon = max(0.05, min(0.5, abs(delta) / 50.0))
@@ -3043,19 +3404,34 @@ def _move_replacements_to_quiet_primary_splices(args, anchors, reference_wav, fo
     if not moved:
         logger.info("  Per-track splice placement found no safely movable replacement ranges.")
         return anchors
-    adjusted = []
-    for ref_name, foreign_name, ref_time, foreign_time in anchors:
-        match = next((item for item in moved if ref_name.startswith(item[0])), None)
-        if match:
-            _, start, end, source_time, _ = match
-            ref_time = start if ref_name.endswith("a_ref") else end
-            foreign_time = source_time
-        adjusted.append((ref_name, foreign_name, ref_time, foreign_time))
-    adjusted.sort(key=lambda item: item[2])
-    if any(right[3] < left[3] for left, right in zip(adjusted, adjusted[1:])):
-        logger.warning("  Per-track splice placement discarded: adjusted anchors would be non-monotonic.")
-        return anchors
+
+    # Evaluate each candidate move independently: one replacement's move breaking
+    # monotonicity must not block every other, already-safe replacement in the episode.
+    adjusted = list(anchors)
+    accepted = []
     for replacement_id, start, end, source_time, source_delta in moved:
+        trial = []
+        for ref_name, foreign_name, ref_time, foreign_time in adjusted:
+            if ref_name.startswith(replacement_id):
+                ref_time = start if ref_name.endswith("a_ref") else end
+                foreign_time = source_time
+            trial.append((ref_name, foreign_name, ref_time, foreign_time))
+        trial.sort(key=lambda item: item[2])
+        violation = next(((left, right) for left, right in zip(trial, trial[1:]) if right[3] < left[3]), None)
+        if violation is not None:
+            left, right = violation
+            logger.warning(f"  Per-track splice placement discarded for {replacement_id}: "
+                           f"adjusted anchors would be non-monotonic ({left[0]}@ref{left[2]:.3f}s/"
+                           f"foreign{left[3]:.3f}s -> {right[0]}@ref{right[2]:.3f}s/foreign{right[3]:.3f}s). "
+                           f"Candidate was ref {start:.3f}s-{end:.3f}s, source {source_time:.3f}s.")
+            continue
+        adjusted = trial
+        accepted.append((replacement_id, start, end, source_time, source_delta))
+
+    if not accepted:
+        logger.info("  Per-track splice placement found no safely movable replacement ranges.")
+        return anchors
+    for replacement_id, start, end, source_time, source_delta in accepted:
         replacement = next(item for item in AUDIO_REPLACEMENT_RANGES if item["id"] == replacement_id)
         replacement.update({
             "ref_start": start,
@@ -3671,6 +4047,30 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         else:
             logger.warning("  Visual program start not found in both videos; using audio boundaries.")
 
+    # A visual black boundary only defines the program picture edge. It is not a
+    # valid timing anchor if its fixed FPS mapping disagrees materially with the
+    # first verified audio correlation after it; accepting it would force a long
+    # distorted first segment (as happened in S02E08).
+    if visual_prefix:
+        next_audio_anchor = next(
+            (anchor for anchor in sorted(visual_anchors_details, key=lambda item: item[2])
+             if anchor[2] > visual_prefix["ref_start"]
+             and anchor[3] > visual_prefix["foreign_end"]),
+            None,
+        )
+        if next_audio_anchor is not None:
+            expected_foreign_time = (
+                visual_prefix["foreign_end"]
+                + (next_audio_anchor[2] - visual_prefix["ref_start"]) * visual_prefix["source_tempo"]
+            )
+            residual = next_audio_anchor[3] - expected_foreign_time
+            if abs(residual) > 0.25:
+                logger.warning(
+                    f"  Visual program start ignored: fixed-FPS mapping differs from next audio anchor "
+                    f"by {residual:+.3f}s (maximum 0.250s)."
+                )
+                visual_prefix = None
+
     ref_delay_s = 0.0 if visual_prefix else ref_start_s
     ref_content_duration = ref_end_s if visual_prefix else ref_end_s - ref_start_s
     foreign_content_duration = foreign_end_s - foreign_start_s
@@ -3705,11 +4105,13 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             (item for item in AUDIO_REPLACEMENT_RANGES if ref_name.startswith(item["id"])),
             None,
         )
-        if (visual_prefix and replacement is not None
-                and replacement["ref_start"] < visual_prefix["ref_start"] < replacement["ref_end"]):
-            logger.info(f"  Skipping {replacement['id']}: visual preamble already covers its "
-                        f"overlapping reference prefix ({replacement['ref_start']:.3f}s-"
-                        f"{replacement['ref_end']:.3f}s).")
+        if visual_prefix and (ref_img_time <= visual_prefix["ref_start"] or foreign_img_time <= visual_prefix["foreign_end"]):
+            if replacement is not None:
+                logger.info(f"  Skipping {replacement['id']}: visual preamble already covers reference "
+                            f"prefix ({replacement['ref_start']:.3f}s-{replacement['ref_end']:.3f}s).")
+            else:
+                logger.debug(f"    Skipping pre-visual anchor {ref_name} (RefT={ref_img_time:.3f}s/"
+                             f"ForeignT={foreign_img_time:.3f}s) - inside visual preamble.")
             continue
         
         if is_forced:
@@ -3897,7 +4299,6 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
         if prefix_path is None:
             logger.error("-> Failed to preserve foreign preamble before visual program start.")
             return None, None
-        processed_segment_files.append(prefix_path)
         actual_prefix_duration = get_file_duration(prefix_path, media_type='audio')
         if actual_prefix_duration is None:
             logger.error("-> Failed to measure preserved foreign preamble duration.")
@@ -3918,10 +4319,13 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             ]
             if not run_ffmpeg(padding_cmd, "Create Visual Start Padding")[0]:
                 return None, None
+            # Place padding at 0:00s (head of the timeline during reference black lead-in)
+            # so the foreign preamble leads seamlessly into the visual program start.
             processed_segment_files.append(padding_path)
             total_processed_ref_duration += visual_padding_duration
-        logger.info(f"  Visual program start aligned: fixed-FPS preamble {actual_prefix_duration:.3f}s + "
-                    f"padding {max(0.0, visual_padding_duration):.3f}s = {visual_prefix['ref_start']:.3f}s")
+        processed_segment_files.append(prefix_path)
+        logger.info(f"  Visual program start aligned: padding {max(0.0, visual_padding_duration):.3f}s (at 0:00s) + "
+                    f"fixed-FPS preamble {actual_prefix_duration:.3f}s = {visual_prefix['ref_start']:.3f}s")
 
     # Configure iterative processing parameters
     max_iterations = 3       # Max attempts per segment
@@ -3995,6 +4399,47 @@ def run_progressive_sync_iterative(args, visual_anchors_details, output_audio_pa
             segment_source_end = ref_end
             logger.info(f"  -> Segment {segment_num}: Filling missing foreign content "
                         f"({ref_start:.3f}s-{ref_end:.3f}s) with reference audio")
+
+        foreign_duration = max(0.0, foreign_end - foreign_start)
+        if i == num_segments - 1 and foreign_duration < target_ref_duration * 0.5:
+            # At the end of the episode there is only one splice boundary, so
+            # preserve the reference ending rather than silently discarding it.
+            ending_gain_db = 0.0
+            context_level = measure_mean_volume_db(
+                foreign_wav_full, max(0.0, foreign_start - 1.5), foreign_start)
+            reference_level = measure_mean_volume_db(ref_wav_full, ref_start, ref_end)
+            if (context_level is not None and context_level > -60.0
+                    and reference_level is not None and reference_level > -60.0):
+                ending_gain_db = max(-15.0, min(15.0, context_level - reference_level))
+                if abs(ending_gain_db) > 0.5:
+                    logger.info(f"  -> Segment {segment_num}: Matching reference ending level to "
+                                f"preceding foreign audio ({reference_level:+.1f}dB -> "
+                                f"{context_level:+.1f}dB, gain {ending_gain_db:+.1f}dB)")
+                else:
+                    ending_gain_db = 0.0
+            logger.warning(f"  -> Segment {segment_num}: Foreign audio is exhausted "
+                           f"({foreign_duration:.3f}s available for {target_ref_duration:.3f}s); "
+                           "using reference audio instead of extreme time-stretching.")
+            fill_path = process_segment_iteratively(
+                foreign_wav_full=ref_wav_full,
+                foreign_start=ref_start,
+                foreign_end=ref_end,
+                ref_duration=target_ref_duration,
+                segment_num=segment_num,
+                temp_dir=temp_dir,
+                max_iterations=max_iterations,
+                target_precision_ms=target_precision_ms,
+                gain_db=ending_gain_db,
+            )
+            fill_ok = fill_path is not None
+            if fill_ok:
+                processed_segment_files.append(fill_path)
+                total_processed_ref_duration += target_ref_duration
+                pbar.update(1)
+                continue
+            logger.error(f" Segment {segment_num}: Failed to generate exhausted-foreign fill.")
+            pbar.close()
+            return None, None
 
         logger.debug(f"Processing Segment {segment_num}/{num_segments}")
 
@@ -4385,7 +4830,7 @@ def resolve_output_audio_settings(source_stream_info, requested_codec, requested
             logger.info(f"  Auto-selected output bitrate '{bitrate}' to match source bitrate.")
         else:
             bitrate = DEFAULT_MUX_ABITRATE_FALLBACK
-            logger.warning(f"  Could not detect source bitrate; using fallback {bitrate}.")
+            logger.info(f"  Source bitrate unavailable; using fallback {bitrate}.")
     return codec, bitrate
 
 
@@ -5171,9 +5616,15 @@ Workflow:
     # --- Input/Output Arguments ---
     parser.add_argument("ref_video", help="Path to the Reference video file (e.g., original language version).")
     parser.add_argument("foreign_video", help="Path to the Foreign video file (e.g., translated language version to be synced).")
-    parser.add_argument("output_video", help="Path for the final muxed video file including reference video, reference audio, and synced foreign audio.")
+    parser.add_argument("output_video", nargs="?", default=None, help="Path for the final muxed video file including reference video, reference audio, and synced foreign audio. Optional only with --visual_map_only.")
     parser.add_argument("--output_audio", metavar="WAV_PATH", default=None, help="Optional: Path to save the synchronized audio as WAV file. If not specified, a temporary file will be used and deleted after muxing.")
     parser.add_argument("--output_csv", metavar="CSV_PATH", default=None, help="Optional: Path to save segment timing information in a CSV file. By default, no CSV is generated.")
+    parser.add_argument("--visual_map_only", action="store_true",
+        help="Run scene-frame visual map analysis and exit without syncing audio or muxing. Requires --visual_map_report_csv.")
+    parser.add_argument("--visual_map_report_csv", metavar="CSV_PATH", default=None,
+        help="Optional: write an analysis-only visual scene map CSV for reference/source videos.")
+    parser.add_argument("--visual_map_qc_dir", metavar="QC_DIR", default=None,
+        help="Optional with --visual_map_report_csv: keep extracted scene frames for manual/QC review.")
     parser.add_argument("--splice_safety_report_csv", metavar="CSV_PATH", default=None,
         help="Optional: Write normalized per-track energy at every planned splice edge. Analysis only; does not change cuts or audio output.")
     parser.add_argument("--no_per_track_splice_placement", dest="per_track_splice_placement",
@@ -5250,6 +5701,11 @@ Workflow:
     audio_group.add_argument("--foreign_anchor_stream_idx", type=int, default=None,
         help="Absolute audio stream index in the foreign video containing the original audio used for audio-to-audio comparison. "
              "If omitted, --foreign_stream_idx is used for backward compatibility.")
+    audio_group.add_argument("--missing_foreign_fill", choices=["auto", "reference", "silence"], default="auto",
+        help="How to fill reference-only intervals detected during audio-audio synchronization. "
+             "'auto' uses reference audio only at safe splice points and silence otherwise. "
+             "'reference' always copies the reference stream for missing source content, useful for eyecatches. "
+             "'silence' always uses neutral silence. (Default: auto)")
     audio_group.add_argument("--foreign_tracks", type=str, default=None, metavar="TRACKS",
         help="Which foreign audio tracks to sync and include in output. "
              "Options: 'primary' (just the main track, default behavior), "
@@ -5293,14 +5749,14 @@ Workflow:
     ConsoleFilter.show_warnings = args.show_warnings
     
     if not args.no_log:
-        log_file_path = args.log_file if args.log_file else get_log_path(args.output_video)
+        log_file_path = args.log_file if args.log_file else (get_log_path(args.output_video) if args.output_video else None)
     
     global logger
     logger, log_file_path = setup_logging(log_file=log_file_path, verbose=args.verbose)
 
     # --- Handle Temporary WAV File ---
     args.output_audio_original = args.output_audio # Store if user specified a path
-    if args.output_audio is None:
+    if args.output_audio is None and not args.visual_map_only:
         # Create a temporary file for the synchronized audio
         temp_audio_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         args.output_audio = temp_audio_file.name
@@ -5320,7 +5776,10 @@ Workflow:
     logger.info("=" * 70)
     logger.info(f"Reference video : {args.ref_video}")
     logger.info(f"Foreign video   : {args.foreign_video}")
-    logger.info(f"Output video    : {args.output_video}")
+    if args.output_video:
+        logger.info(f"Output video    : {args.output_video}")
+    if args.visual_map_report_csv:
+        logger.info(f"Visual map CSV  : {args.visual_map_report_csv}")
     if log_file_path:
         logger.info(f"Log file        : {log_file_path}")
     if args.output_audio_original:
@@ -5351,6 +5810,52 @@ Workflow:
     # --- Validate Input/Output Paths ---
     if not os.path.isfile(args.ref_video): logger.error(f"Reference video not found: {args.ref_video}"); sys.exit(1)
     if not os.path.isfile(args.foreign_video): logger.error(f"Foreign video not found: {args.foreign_video}"); sys.exit(1)
+    if not args.output_video and not args.visual_map_only:
+        logger.error("Output video path is required unless --visual_map_only is used.")
+        if args.output_audio_original is None and args.output_audio and os.path.exists(args.output_audio):
+            try: os.remove(args.output_audio)
+            except Exception: pass
+        sys.exit(1)
+    if args.visual_map_only and not args.visual_map_report_csv:
+        logger.error("--visual_map_only requires --visual_map_report_csv.")
+        if args.output_audio_original is None and args.output_audio and os.path.exists(args.output_audio):
+            try: os.remove(args.output_audio)
+            except Exception: pass
+        sys.exit(1)
+
+    if args.visual_map_only:
+        # Analysis-only path: no audio stream/language selection is needed.
+        output_paths_to_check = [args.visual_map_report_csv]
+        for path in output_paths_to_check:
+            if path:
+                try:
+                    out_dir = os.path.dirname(os.path.abspath(path)) or '.'
+                    os.makedirs(out_dir, exist_ok=True)
+                    if not os.access(out_dir, os.W_OK):
+                        raise OSError(f"Output directory is not writable: {out_dir}")
+                    if os.path.exists(path) and os.path.isfile(path):
+                        logger.warning(f"Output file '{os.path.basename(path)}' exists and will be overwritten.")
+                except Exception as e:
+                    logger.error(f"Output path validation failed for '{path}': {e}")
+                    sys.exit(1)
+        if args.visual_map_qc_dir:
+            try:
+                os.makedirs(args.visual_map_qc_dir, exist_ok=True)
+                if not os.access(args.visual_map_qc_dir, os.W_OK):
+                    raise OSError(f"QC output directory is not writable: {args.visual_map_qc_dir}")
+            except Exception as e:
+                logger.error(f"Visual map QC directory validation failed for '{args.visual_map_qc_dir}': {e}")
+                sys.exit(1)
+        try:
+            with tempfile.TemporaryDirectory(prefix="gsync_visual_map_") as temp_dir:
+                logger.info(f"\nUsing temporary directory: {temp_dir}")
+                if not write_visual_map_report(args, temp_dir):
+                    sys.exit(1)
+        finally:
+            if args.output_audio_original is None and args.output_audio and os.path.exists(args.output_audio):
+                try: os.remove(args.output_audio)
+                except Exception: pass
+        sys.exit(0)
 
     # --- Validate Foreign Language Code (for primary track / --foreign_lang default) ---
     # This validates the --foreign_lang argument. Per-track language validation happens later.
@@ -5537,6 +6042,8 @@ Workflow:
                     jump_tolerance_seconds=args.audio_jump_tolerance,
                     anchor_report_csv=args.anchor_report_csv,
                     transition_report_csv=args.transition_report_csv,
+                    visual_program_bounds=args.visual_program_bounds,
+                    missing_foreign_fill=args.missing_foreign_fill,
                 )
                 if visual_anchors_details is None:
                     raise RuntimeError("Audio Anchor Pairing Stage Failed: No audio anchors generated.")
