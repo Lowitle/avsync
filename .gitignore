@@ -5,4 +5,7 @@ avsync.code-workspace
 video_test/
 *_avsync.log
 test_log.txt
+scan_noise_floor.py
+test_independent_replacement_relocation.py
+test_with_loudness.py
 .avsync_cache/
