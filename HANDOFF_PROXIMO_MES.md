@@ -96,8 +96,7 @@ La direccion actual del proyecto es:
 - No existe todavia una configuracion de paquete `pyproject.toml` en este repo.
   Packaging/PyPI se dejo para una fase posterior y no bloquea el lanzamiento.
 - GitHub Sponsors/Open Collective aun no estan activados.
-- No se ha creado todavia una release/tag publico definitivo, aunque la
-  recomendacion acordada es `v1.0.0`.
+- La release/tag publico `v1.0.0` ya existe en GitHub.
 
 ## 4. Estado del working tree al hacer este documento
 
@@ -123,12 +122,12 @@ utilidades locales sin revisar su utilidad primero.
 ### Prioridad 1: cerrar la publicacion inicial
 
 1. Revisar en GitHub que el repo sea visible publicamente.
-2. Usar como nombre visible: `AVSync AA - Audio-to-Audio Dubbing Synchronization Engine`.
+2. Mantener como nombre visible: `AVSync AA`.
 3. Usar como descripcion corta:
 
    `Audio-to-audio synchronization for remastering dubbed tracks onto a reference timeline while preserving the original video and metadata.`
 
-4. Crear el tag y release `v1.0.0`.
+4. Mantener la release `v1.0.0` y revisar sus notas.
 5. Usar release notes centradas en AA validado, 53/53 episodios y VV como
    roadmap, sin presentar VV como funcionalidad terminada.
 6. Revisar la licencia upstream y la atribucion del fork antes de promocionarlo
